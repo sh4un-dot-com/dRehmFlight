@@ -35,6 +35,7 @@ def parse_args():
     p.add_argument('--iters', type=int, default=20)
     p.add_argument('--scale', type=float, default=0.2, help='relative perturbation scale (stddev for gaussian)')
     p.add_argument('--pop', type=int, default=1, help='population size for each generation (1 = single-step ES)')
+    p.add_argument('--method', choices=['es','cmaes'], default='es', help='optimization method: ES (default) or CMAES-like adaptive ES')
     p.add_argument('--min-gain', type=float, default=0.0, help='minimum allowed gain value')
     p.add_argument('--max-gain', type=float, default=5.0, help='maximum allowed gain value')
     p.add_argument('--log-file', default='tools/autoopt_results.csv', help='CSV log file for trials')
@@ -160,25 +161,31 @@ def main():
             # population of candidates
             for cand in range(args.pop):
                 # sample perturbation factor(s) gaussian around 1.0
+                # sampling: support both plain ES and a CMAES-like adaptive sigma mode
+                if 'sigma' not in locals():
+                    sigma = args.scale
+                def sample_mult(v):
+                    return v * max(0.0, random.gauss(1.0, sigma))
+
                 if args.axis == 'BOTH':
                     # mutate both roll & pitch (independently)
-                    kp_r = best['Kp_roll_angle'] * max(0.0, random.gauss(1.0, args.scale))
-                    ki_r = best['Ki_roll_angle'] * max(0.0, random.gauss(1.0, args.scale))
-                    kd_r = best['Kd_roll_angle'] * max(0.0, random.gauss(1.0, args.scale))
-                    kp_p = best['Kp_pitch_angle'] * max(0.0, random.gauss(1.0, args.scale))
-                    ki_p = best['Ki_pitch_angle'] * max(0.0, random.gauss(1.0, args.scale))
-                    kd_p = best['Kd_pitch_angle'] * max(0.0, random.gauss(1.0, args.scale))
+                    kp_r = sample_mult(best['Kp_roll_angle'])
+                    ki_r = sample_mult(best['Ki_roll_angle'])
+                    kd_r = sample_mult(best['Kd_roll_angle'])
+                    kp_p = sample_mult(best['Kp_pitch_angle'])
+                    ki_p = sample_mult(best['Ki_pitch_angle'])
+                    kd_p = sample_mult(best['Kd_pitch_angle'])
                 else:
                     axis = args.axis
                     if axis == 'ROLL':
-                        kp_r = best['Kp_roll_angle'] * max(0.0, random.gauss(1.0, args.scale))
-                        ki_r = best['Ki_roll_angle'] * max(0.0, random.gauss(1.0, args.scale))
-                        kd_r = best['Kd_roll_angle'] * max(0.0, random.gauss(1.0, args.scale))
+                        kp_r = sample_mult(best['Kp_roll_angle'])
+                        ki_r = sample_mult(best['Ki_roll_angle'])
+                        kd_r = sample_mult(best['Kd_roll_angle'])
                         kp_p, ki_p, kd_p = best['Kp_pitch_angle'], best['Ki_pitch_angle'], best['Kd_pitch_angle']
                     else:
-                        kp_p = best['Kp_pitch_angle'] * max(0.0, random.gauss(1.0, args.scale))
-                        ki_p = best['Ki_pitch_angle'] * max(0.0, random.gauss(1.0, args.scale))
-                        kd_p = best['Kd_pitch_angle'] * max(0.0, random.gauss(1.0, args.scale))
+                        kp_p = sample_mult(best['Kp_pitch_angle'])
+                        ki_p = sample_mult(best['Ki_pitch_angle'])
+                        kd_p = sample_mult(best['Kd_pitch_angle'])
                         kp_r, ki_r, kd_r = best['Kp_roll_angle'], best['Ki_roll_angle'], best['Kd_roll_angle']
 
                 # clamp
@@ -253,6 +260,15 @@ def main():
             if no_improve >= args.patience:
                 print('Early stopping: no improvement for', args.patience, 'generations')
                 break
+
+            # adapt sigma if using CMAES-like method
+            if args.method == 'cmaes':
+                # small adaptive step-size: shrink on improvement, expand on stagnation
+                if improved:
+                    sigma = max(1e-4, sigma * 0.95)
+                else:
+                    sigma = min(2.0, sigma * 1.05)
+                print(f'  [method=cmaes] sigma={sigma:.5f}')
 
         # finished iterations
         print('Optimization finished. Best cost=', best_cost)

@@ -77,7 +77,7 @@ THIS SOFTWARE IS PROVIDED BY THE CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED
   1. Add MAVLink headers (generate via mavlink generator or install a MAVLink library) and ensure include path is available.
   2. Build with `-DUSE_MAVLINK_LIB` to enable the native branch. If not defined, a JSON-based MAVBRIDGE fallback is used.
 
-- Offboard optimizer (tools/autoopt_simple_es.py): expanded with population-mode, CSV logging, gain bounds, early-stopping and support for optimizing `ROLL`, `PITCH` or `BOTH`.
+- Offboard optimizer (tools/autoopt_simple_es.py): expanded with population-mode, CSV logging, gain bounds, early-stopping and support for optimizing `ROLL`, `PITCH` or `BOTH`. New `--method` option supports `es` (default) and a lightweight `cmaes`‑style adaptive-sigma strategy; see script `--help` for details.
 
 ### PlatformIO example (quick-start)
 

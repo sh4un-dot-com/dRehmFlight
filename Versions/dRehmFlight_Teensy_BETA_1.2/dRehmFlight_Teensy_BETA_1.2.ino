@@ -93,6 +93,11 @@ RcGroups 'jihlein' - IMU implementation overhaul + SBUS implementation
   #include "model_data.h"
 #endif
 
+// Minimal MAVLink stub for local/native MAVLink branch (builds when USE_MAVLINK_LIB is defined)
+#if defined(USE_MAVLINK_LIB)
+  #include "src/Mavlink/mavlink_stub.h"
+#endif
+
 
 #if defined USE_SBUS_RX
   #include "src/SBUS/SBUS.h"   //sBus interface
