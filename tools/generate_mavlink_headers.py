@@ -26,9 +26,9 @@ if __name__ == '__main__':
 
     try:
         # import lazily to avoid failing in environments without pymavlink
-        import subprocess
-        from pymavlink.generator import mavgen
-    except Exception as e:
+        import importlib
+        mavgen = importlib.import_module('pymavlink.generator.mavgen')
+    except Exception:
         print_instructions(args.out)
         # Non-fatal: repository ships a minimal stub; allow script to exit cleanly
         raise SystemExit(0)
@@ -36,12 +36,26 @@ if __name__ == '__main__':
     print('Generating MAVLink headers for dialect:', args.dialect)
     try:
         os.makedirs(args.out, exist_ok=True)
-        # Call mavgen API; different pymavlink versions may expose different signatures
+        # Build opts and locate the XML dialect file shipped with pymavlink
         try:
-            mavgen.mavgen(args.dialect, language='C', output=args.out)
-        except TypeError:
-            # fallback: call mavgen directly if module is callable
-            mavgen(args.dialect, language='C', output=args.out)
+            # Choose wire protocol 2.0 by default
+            opts = mavgen.Opts(args.out, mavgen.DEFAULT_WIRE_PROTOCOL, language='C', validate=False)
+        except Exception:
+            opts = mavgen.Opts(args.out, '2.0', language='C', validate=False)
+
+        # locate builtin dialect xml (pymavlink ships dialects in generator/dialects)
+        dialects_dir = os.path.join(os.path.dirname(os.path.realpath(mavgen.__file__)), '..', 'dialects')
+        xml_path = os.path.join(dialects_dir, 'v20', args.dialect + '.xml')
+        if not os.path.exists(xml_path):
+            # fallback to message_definitions tree
+            mdef = os.path.join(os.path.dirname(os.path.realpath(mavgen.__file__)), '..', '..', 'message_definitions')
+            xml_path = os.path.join(mdef, 'v1.0', args.dialect + '.xml')
+
+        if not os.path.exists(xml_path):
+            raise FileNotFoundError('Dialect XML not found for %s (checked %s)' % (args.dialect, xml_path))
+
+        # Call the mavgen API: it expects (opts, [xml_files])
+        mavgen.mavgen(opts, [os.path.relpath(xml_path)])
         print('Generated headers in', args.out)
     except Exception as e:
         print('MAVLink header generation failed:', e)
