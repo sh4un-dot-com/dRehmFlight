@@ -268,6 +268,48 @@ static enum AutoAxis {AUTO_NONE=0, AUTO_ROLL=1, AUTO_PITCH=2} autotuneAxis = AUT
 static float autotuneRelayOutRoll = 0.0f;  // override value applied to roll_PID during autotune
 static float autotuneRelayOutPitch = 0.0f; // override value applied to pitch_PID during autotune
 
+// --- Non-blocking autotune (state-machine) prototypes & state ---
+bool startAutotuneNonBlocking(AutoAxis axis, float relayAmp = 0.25f, int cycles = 6);
+void stopAutotuneNonBlocking();
+void autotuneUpdate();
+
+// Internal non-blocking autotune state
+struct AutotuneNB {
+  bool active = false;
+  AutoAxis axis = AUTO_NONE;
+  float relayAmp = 0.25f;
+  int totalToggles = 0;
+  int togglesDone = 0;
+  unsigned long halfPeriodUs = 500L * 1000L;
+  unsigned long lastToggleUs = 0;
+  bool relayState = false; // true => +relayAmp, false => -relayAmp
+  float prevPV[3];
+  int nPrev = 0;
+  float maxima[16]; unsigned long maxTimes[16]; int nMax = 0;
+  float minima[16]; unsigned long minTimes[16]; int nMin = 0;
+} autotuneNB;
+
+// ------------------ Flight-data recorder (serial CSV) ------------------
+static bool recRecording = false;
+static unsigned long recLastTime = 0;
+static unsigned long recIntervalUs = 50000; // default 20 Hz
+void recordUpdate();
+
+// ------------------ Simple anomaly detector (placeholder TFLM hook) ------------------
+static bool anomalyFlag = false;
+static float anomalyScore = 0.0f;
+void detectAnomalies();
+
+// ------------------ Auto-optimization telemetry (offboard) ------------------
+static bool autooptRunning = false;
+static unsigned long autooptLast = 0;
+static unsigned long autooptIntervalUs = 10000; // 100 Hz
+void autooptUpdate();
+
+// ------------------ MAVLink bridge (optional) ------------------
+static bool mavlinkBridgeEnabled = false; // fallback bridge (JSON) if true
+void mavlinkBridgeSendHeartbeat();
+
 
 
 //========================================================================================================================//
@@ -470,6 +512,13 @@ void loop() {
   //Get vehicle commands for next loop iteration
   getCommands(); //pulls current available radio commands
   failSafe(); //prevent failures in event of bad receiver connection, defaults to failsafe values assigned in setup
+
+  // background feature updates
+  autotuneUpdate();        // non-blocking autotune state-machine
+  detectAnomalies();       // basic onboard anomaly checks
+  recordUpdate();          // flight-data recorder (serial CSV)
+  autooptUpdate();         // offboard optimization telemetry
+  if (mavlinkBridgeEnabled) mavlinkBridgeSendHeartbeat(); // optional MAVLink bridge (stub)
 
   // Telemetry streaming (JSON) when aux channel 6 is high — useful for ML/AI ingestion or logging
   if (channel_6_pwm > 1500 && current_time - serial_counter > 200000) {
@@ -1724,7 +1773,12 @@ void handleSerialCommands() {
     return;
   }
 
-  // AUTOTUNE <ROLL|PITCH> [relayAmp]
+  // AUTOTUNE <ROLL|PITCH> [relayAmp]  (non-blocking)
+  if (cmd.equalsIgnoreCase("AUTOTUNE STOP")) {
+    stopAutotuneNonBlocking();
+    Serial.println("AUTOTUNE STOPPED");
+    return;
+  }
   if (cmd.startsWith("AUTOTUNE ")) {
     // format: AUTOTUNE ROLL 0.25
     int sp = cmd.indexOf(' ');
@@ -1733,22 +1787,42 @@ void handleSerialCommands() {
     int sp2 = rest.indexOf(' ');
     String axisStr = (sp2 > 0) ? rest.substring(0, sp2) : rest;
     String ampStr = (sp2 > 0) ? rest.substring(sp2 + 1) : "0.25";
-    axisStr.toUpperCase();
     float amp = ampStr.toFloat();
     if (amp <= 0.0f) amp = 0.25f;
     if (axisStr.equalsIgnoreCase("ROLL")) {
-      Serial.println("AUTOTUNE starting ROLL — keep throttle low and vehicle secure");
-      runRelayAutotune(AUTO_ROLL, amp, 6);
+      Serial.println("AUTOTUNE STARTED (non-blocking) ROLL — keep throttle low and vehicle secure");
+      startAutotuneNonBlocking(AUTO_ROLL, amp, 6);
       return;
     } else if (axisStr.equalsIgnoreCase("PITCH")) {
-      Serial.println("AUTOTUNE starting PITCH — keep throttle low and vehicle secure");
-      runRelayAutotune(AUTO_PITCH, amp, 6);
+      Serial.println("AUTOTUNE STARTED (non-blocking) PITCH — keep throttle low and vehicle secure");
+      startAutotuneNonBlocking(AUTO_PITCH, amp, 6);
       return;
     } else {
       Serial.println("ERR unknown axis (use ROLL or PITCH)");
       return;
     }
   }
+
+  // RECORDER: REC START / REC STOP / REC RATE <Hz>
+  if (cmd.equalsIgnoreCase("REC START")) { recRecording = true; recLastTime = micros(); Serial.println("REC STARTED"); return; }
+  if (cmd.equalsIgnoreCase("REC STOP")) { recRecording = false; Serial.println("REC STOPPED"); return; }
+  if (cmd.startsWith("REC RATE ")) {
+    String v = cmd.substring(9);
+    int hz = v.toInt(); if (hz < 1) hz = 1; if (hz > 500) hz = 500;
+    recIntervalUs = 1000000UL / hz; Serial.print("OK REC RATE "); Serial.println(hz); return;
+  }
+
+  // AUTOOPT telemetry stream for offboard optimization
+  if (cmd.equalsIgnoreCase("AUTOOPT START")) { autooptRunning = true; autooptLast = micros(); Serial.println("AUTOOPT STARTED"); return; }
+  if (cmd.equalsIgnoreCase("AUTOOPT STOP")) { autooptRunning = false; Serial.println("AUTOOPT STOPPED"); return; }
+
+  // ANOMALY commands
+  if (cmd.equalsIgnoreCase("ANOMALY GET")) { Serial.print("ANOMALY "); Serial.print(anomalyFlag ? "TRUE" : "FALSE"); Serial.print(" SCORE "); Serial.println(anomalyScore); return; }
+  if (cmd.equalsIgnoreCase("ANOMALY RESET")) { anomalyFlag = false; anomalyScore = 0.0f; Serial.println("OK ANOMALY RESET"); return; }
+
+  // MAVBRIDGE (fallback simple MAVLink-like JSON bridge)
+  if (cmd.equalsIgnoreCase("MAVBRIDGE START")) { mavlinkBridgeEnabled = true; Serial.println("MAVBRIDGE STARTED"); return; }
+  if (cmd.equalsIgnoreCase("MAVBRIDGE STOP")) { mavlinkBridgeEnabled = false; Serial.println("MAVBRIDGE STOPPED"); return; }
 
   Serial.println("ERR unknown command");
 }
@@ -1973,4 +2047,183 @@ bool runRelayAutotune(AutoAxis axis, float relayAmp = 0.25f, int cycles = 6) {
 
   return true;
 }
+
+// ---------------------- Non-blocking autotune implementation ----------------------
+bool startAutotuneNonBlocking(AutoAxis axis, float relayAmp, int cycles) {
+  if (channel_1_pwm > 1060) {
+    Serial.println("ERR: throttle must be low (<1060) to run autotune");
+    return false;
+  }
+  if (autotuneNB.active) {
+    Serial.println("ERR: autotune already running");
+    return false;
+  }
+  autotuneNB.active = true;
+  autotuneNB.axis = axis;
+  autotuneNB.relayAmp = relayAmp;
+  autotuneNB.totalToggles = cycles * 2;
+  autotuneNB.togglesDone = 0;
+  autotuneNB.halfPeriodUs = 500UL * 1000UL; // 500ms default
+  autotuneNB.lastToggleUs = micros();
+  autotuneNB.relayState = true;
+  autotuneNB.nPrev = 0; autotuneNB.nMax = 0; autotuneNB.nMin = 0;
+  autotuneRunning = true; autotuneAxis = axis;
+  Serial.println("OK AUTOTUNE (non-blocking) started");
+  return true;
+}
+
+void stopAutotuneNonBlocking() {
+  autotuneNB.active = false;
+  autotuneRunning = false;
+  autotuneAxis = AUTO_NONE;
+  autotuneRelayOutRoll = 0.0f;
+  autotuneRelayOutPitch = 0.0f;
+  Serial.println("OK AUTOTUNE stopped");
+}
+
+void autotuneUpdate() {
+  if (!autotuneNB.active) return;
+  unsigned long now = micros();
+  // toggle relay state on half period
+  if ((now - autotuneNB.lastToggleUs) >= autotuneNB.halfPeriodUs) {
+    autotuneNB.relayState = !autotuneNB.relayState;
+    autotuneNB.lastToggleUs = now;
+    autotuneNB.togglesDone++;
+  }
+  // apply relay output to appropriate channel override
+  float out = autotuneNB.relayState ? autotuneNB.relayAmp : -autotuneNB.relayAmp;
+  if (autotuneNB.axis == AUTO_ROLL) autotuneRelayOutRoll = out; else autotuneRelayOutPitch = out;
+
+  // sample PV and detect local extrema using 3-sample window
+  float pv = (autotuneNB.axis == AUTO_ROLL) ? roll_IMU : pitch_IMU;
+  float prev0 = autotuneNB.prevPV[0];
+  float prev1 = autotuneNB.prevPV[1];
+  // shift
+  autotuneNB.prevPV[0] = prev1;
+  autotuneNB.prevPV[1] = pv;
+  if (autotuneNB.nPrev < 2) autotuneNB.nPrev++;
+  // detect maxima/minima when we have 3 samples (prev0, prev1, pv)
+  if (autotuneNB.nPrev >= 2) {
+    if (prev1 >= prev0 && prev1 >= pv) {
+      if (autotuneNB.nMax < 16) { autotuneNB.maxima[autotuneNB.nMax] = prev1; autotuneNB.maxTimes[autotuneNB.nMax] = now; autotuneNB.nMax++; }
+    }
+    if (prev1 <= prev0 && prev1 <= pv) {
+      if (autotuneNB.nMin < 16) { autotuneNB.minima[autotuneNB.nMin] = prev1; autotuneNB.minTimes[autotuneNB.nMin] = now; autotuneNB.nMin++; }
+    }
+  }
+
+  // finish when toggles complete
+  if (autotuneNB.togglesDone >= autotuneNB.totalToggles) {
+    // stop relay override
+    autotuneRelayOutRoll = 0.0f; autotuneRelayOutPitch = 0.0f;
+    autotuneNB.active = false; autotuneRunning = false; autotuneAxis = AUTO_NONE;
+
+    // need enough peaks to estimate
+    if (autotuneNB.nMax < 4 || autotuneNB.nMin < 4) {
+      Serial.println("ERR: insufficient peaks detected by non-blocking autotune");
+      return;
+    }
+
+    // compute average peak-to-peak amplitude (use first several pairs)
+    int usePairs = min(min(autotuneNB.nMax - 1, autotuneNB.nMin - 1), 6);
+    float sumAmp = 0.0f; int pairs = 0;
+    for (int i = 0; i < usePairs; i++) {
+      float a = autotuneNB.maxima[1 + i] - autotuneNB.minima[1 + i];
+      sumAmp += a; pairs++;
+    }
+    float peakToPeak = (pairs > 0) ? (sumAmp / pairs) : 0.0f;
+    float A = peakToPeak / 2.0f;
+
+    // compute period Pu from maxima times
+    float sumPeriod = 0.0f; int nPeriods = 0;
+    for (int i = 1; i < min(autotuneNB.nMax, 10); i++) {
+      unsigned long dt_us = autotuneNB.maxTimes[i] - autotuneNB.maxTimes[i-1];
+      if (dt_us > 10000) { sumPeriod += (float)dt_us / 1000000.0f; nPeriods++; }
+    }
+    float Pu = (nPeriods > 0) ? (sumPeriod / nPeriods) : 0.0f;
+
+    if (A <= 0.0f || Pu <= 0.0f) {
+      Serial.println("ERR: invalid amplitude/period measured (non-blocking)");
+      return;
+    }
+    const float PI_F = 3.14159265358979323846f;
+    float Ku = (4.0f * autotuneNB.relayAmp) / (PI_F * A);
+
+    // Z-N with safety scale
+    float Kp_new = 0.6f * Ku * tune_scale;
+    float Ti = 0.5f * Pu;
+    float Ki_new = (Ti > 0.0f) ? (Kp_new / Ti) : 0.0f;
+    float Td = 0.125f * Pu;
+    float Kd_new = Kp_new * Td;
+
+    if (autotuneNB.axis == AUTO_ROLL) {
+      Kp_roll_angle = Kp_new; Ki_roll_angle = Ki_new; Kd_roll_angle = Kd_new;
+    } else {
+      Kp_pitch_angle = Kp_new; Ki_pitch_angle = Ki_new; Kd_pitch_angle = Kd_new;
+    }
+    saveParametersToEEPROM();
+    Serial.print("{\"Ku\":"); Serial.print(Ku);
+    Serial.print(",\"Pu\":"); Serial.print(Pu);
+    Serial.print(",\"Kp\":"); Serial.print(Kp_new);
+    Serial.print(",\"Ki\":"); Serial.print(Ki_new);
+    Serial.print(",\"Kd\":"); Serial.print(Kd_new);
+    Serial.println("}");
+  }
+}
+
+// ---------------------- Flight-data recorder (serial CSV) ------------------
+void recordUpdate() {
+  if (!recRecording) return;
+  unsigned long now = micros();
+  if ((now - recLastTime) < recIntervalUs) return;
+  recLastTime = now;
+  // CSV: t_ms,roll,pitch,yaw,thro,ch1,ch2,ch3,ch4,m1..m6
+  Serial.print("REC,"); Serial.print(millis()); Serial.print(',');
+  Serial.print(roll_IMU); Serial.print(','); Serial.print(pitch_IMU); Serial.print(','); Serial.print(yaw_IMU); Serial.print(',');
+  Serial.print(thro_des); Serial.print(','); Serial.print(channel_1_pwm); Serial.print(','); Serial.print(channel_2_pwm); Serial.print(',');
+  Serial.print(channel_3_pwm); Serial.print(','); Serial.print(channel_4_pwm);
+  Serial.print(','); Serial.print(m1_command_PWM); Serial.print(','); Serial.print(m2_command_PWM); Serial.print(',');
+  Serial.print(m3_command_PWM); Serial.print(','); Serial.print(m4_command_PWM); Serial.print(','); Serial.print(m5_command_PWM); Serial.print(','); Serial.println(m6_command_PWM);
+}
+
+// ---------------------- Simple anomaly detector (placeholder) ------------------
+void detectAnomalies() {
+  anomalyScore = 0.0f; anomalyFlag = false;
+  // gyro spike
+  if (fabs(GyroX) > 1000.0f || fabs(GyroY) > 1000.0f || fabs(GyroZ) > 1000.0f) { anomalyScore += 0.6f; }
+  // accel spike
+  if (fabs(AccX) > 4.0f || fabs(AccY) > 4.0f || fabs(AccZ) > 6.0f) { anomalyScore += 0.6f; }
+  // motor saturation without attitude change (simple heuristic)
+  if (thro_des > 0.5f) {
+    if ((m1_command_PWM > 230 || m2_command_PWM > 230 || m3_command_PWM > 230 || m4_command_PWM > 230) && (fabs(roll_IMU) < 0.5f && fabs(pitch_IMU) < 0.5f)) {
+      anomalyScore += 0.4f;
+    }
+  }
+  if (anomalyScore > 0.3f) { anomalyFlag = true; Serial.print("ALERT:ANOMALY score="); Serial.println(anomalyScore); }
+}
+
+// ---------------------- Auto-opt telemetry (high-rate streaming) ------------------
+void autooptUpdate() {
+  if (!autooptRunning) return;
+  unsigned long now = micros();
+  if ((now - autooptLast) < autooptIntervalUs) return;
+  autooptLast = now;
+  // compact CSV for offboard optimizers
+  Serial.print("OPT,"); Serial.print(millis()); Serial.print(',');
+  Serial.print(dt*1000000.0); Serial.print(','); // loop_us
+  Serial.print(roll_IMU); Serial.print(','); Serial.print(pitch_IMU); Serial.print(','); Serial.print(yaw_IMU); Serial.print(',');
+  Serial.print(GyroX); Serial.print(','); Serial.print(GyroY); Serial.print(','); Serial.print(GyroZ); Serial.print(',');
+  Serial.print(AccX); Serial.print(','); Serial.print(AccY); Serial.print(','); Serial.print(AccZ); Serial.println();
+}
+
+// ---------------------- Simple MAVLink bridge (fallback JSON messages) ------------------
+void mavlinkBridgeSendHeartbeat() {
+  static unsigned long lastHb = 0;
+  if (micros() - lastHb < 1000000UL) return; // 1 Hz
+  lastHb = micros();
+  Serial.print("MAVLINK,HEARTBEAT,"); Serial.print(millis()); Serial.println();
+  // also send attitude
+  Serial.print("MAVLINK,ATTITUDE,\""); Serial.print(roll_IMU); Serial.print("\","); Serial.print(pitch_IMU); Serial.print(","); Serial.println(yaw_IMU);
+}
+
 
