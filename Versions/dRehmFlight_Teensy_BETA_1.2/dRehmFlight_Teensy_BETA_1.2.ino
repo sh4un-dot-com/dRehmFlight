@@ -80,6 +80,19 @@ RcGroups 'jihlein' - IMU implementation overhaul + SBUS implementation
 #include <EEPROM.h>   //persistent parameter storage (PID gains, tune settings)
 #include <SD.h>       //SD card logging (optional)
 
+// TinyML fallback model (pure-C) - included by default; real TFLM path is optional at build time
+#include "src/TinyML/simple_model.h"
+
+#if USE_TFLM
+  // If enabling real TensorFlow Lite Micro, these headers will be used (must add TFLM + model_data to build)
+  #include "tensorflow/lite/micro/all_ops_resolver.h"
+  #include "tensorflow/lite/micro/micro_interpreter.h"
+  #include "tensorflow/lite/schema/schema_generated.h"
+  #include "tensorflow/lite/version.h"
+  // model_data.h must be provided by user when USE_TFLM=1
+  #include "model_data.h"
+#endif
+
 
 #if defined USE_SBUS_RX
   #include "src/SBUS/SBUS.h"   //sBus interface
@@ -338,15 +351,26 @@ bool initSD();
 bool recOpenFile();
 void recCloseFile();
 
-// ------------------ Simple anomaly detector (placeholder TFLM hook) ------------------
+// ------------------ Simple anomaly detector (TinyML / TFLM) ------------------
 static bool anomalyFlag = false;
 static float anomalyScore = 0.0f;
 
-// TinyML / TFLM integration flag + stubs
+// TinyML / TFLM integration flag
 #ifndef USE_TFLM
   #define USE_TFLM 0
 #endif
 static bool tflmEnabled = false;
+
+#if USE_TFLM
+  // TFLM runtime globals (only compiled when USE_TFLM=1)
+  static tflite::MicroInterpreter* tflm_interpreter = nullptr;
+  static TfLiteTensor* tflm_input = nullptr;
+  static TfLiteTensor* tflm_output = nullptr;
+  // Tensor arena (adjust size for your model)
+  static const int TFLM_ARENA_SIZE = 10 * 1024;
+  static uint8_t tflm_tensor_arena[TFLM_ARENA_SIZE];
+#endif
+
 void initTFLM();
 float runTFLMAnomalyDetector();
 void detectAnomalies();
@@ -2294,20 +2318,47 @@ void recordUpdate() {
 // ---------------------- Simple anomaly detector (placeholder) ------------------
 void initTFLM() {
 #if USE_TFLM
-  // Placeholder: initialize TFLM runtime and load model
-  // Real implementation: add TFLM library, provide model array, allocate arena, and set up interpreter
-  Serial.println("TFLM: initialized (stub)");
+  // Real TensorFlow Lite Micro initialization (requires model_data.h and TFLM library in project)
+  const tflite::Model* model = tflite::GetModel(model_data);
+  if (model->version() != TFLITE_SCHEMA_VERSION) {
+    Serial.println("TFLM: model schema mismatch");
+    return;
+  }
+  static tflite::AllOpsResolver resolver;
+  tflm_interpreter = new tflite::MicroInterpreter(model, resolver, tflm_tensor_arena, TFLM_ARENA_SIZE, nullptr);
+  if (tflm_interpreter->AllocateTensors() != kTfLiteOk) {
+    Serial.println("TFLM: AllocateTensors() failed");
+    return;
+  }
+  tflm_input = tflm_interpreter->input(0);
+  tflm_output = tflm_interpreter->output(0);
+  Serial.println("TFLM: initialized (using model_data.h)");
 #else
-  Serial.println("TFLM: not enabled at build time");
+  // Fallback tiny-C model (works without adding TensorFlow Lite Micro)
+  simple_model_init();
+  Serial.println("TFLM: fallback (C model) initialized");
 #endif
-}
+} 
 
 float runTFLMAnomalyDetector() {
 #if USE_TFLM
-  // Real inference would go here — return normalized anomaly score [0..1]
-  return 0.0f; // stub
+  if (!tflm_interpreter || !tflm_input || !tflm_output) return 0.0f;
+  // NOTE: model input layout depends on the tflite you provide. This example assumes a 1-D float input of length 8
+  float features[8];
+  features[0] = roll_IMU; features[1] = pitch_IMU;
+  features[2] = GyroX; features[3] = GyroY; features[4] = GyroZ;
+  features[5] = AccX; features[6] = AccY; features[7] = AccZ;
+  // copy into tensor and run
+  for (int i = 0; i < 8 && i < tflm_input->dims->data[1]; ++i) tflm_input->data.f[i] = features[i];
+  if (tflm_interpreter->Invoke() != kTfLiteOk) return 0.0f;
+  float score = tflm_output->data.f[0];
+  if (score < 0.0f) score = 0.0f;
+  if (score > 1.0f) score = 1.0f;
+  return score;
 #else
-  return 0.0f; // stub
+  // Use lightweight C-implemented model (deterministic, no external deps)
+  float score = simple_model_predict(roll_IMU, pitch_IMU, GyroX, GyroY, GyroZ, AccX, AccY, AccZ, thro_des);
+  return score;
 #endif
 }
 
