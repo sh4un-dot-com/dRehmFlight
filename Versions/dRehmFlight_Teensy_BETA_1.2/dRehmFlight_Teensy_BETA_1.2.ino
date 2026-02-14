@@ -78,6 +78,8 @@ RcGroups 'jihlein' - IMU implementation overhaul + SBUS implementation
 #include <SPI.h>      //SPI communication
 #include <PWMServo.h> //commanding any extra actuators, installed with teensyduino installer
 #include <EEPROM.h>   //persistent parameter storage (PID gains, tune settings)
+#include <SD.h>       //SD card logging (optional)
+
 
 #if defined USE_SBUS_RX
   #include "src/SBUS/SBUS.h"   //sBus interface
@@ -289,15 +291,64 @@ struct AutotuneNB {
   float minima[16]; unsigned long minTimes[16]; int nMin = 0;
 } autotuneNB;
 
-// ------------------ Flight-data recorder (serial CSV) ------------------
-static bool recRecording = false;
+// ------------------ Flight-data recorder (serial CSV/SD) ------------------
+static bool recRecording = false;               // serial CSV recorder
+static bool recRecordingSD = false;             // SD-card recorder flag
 static unsigned long recLastTime = 0;
 static unsigned long recIntervalUs = 50000; // default 20 Hz
+static File recFile;
+static bool sdAvailable = false;
+static const uint8_t SD_CS_PIN = 
+  #if defined(BUILTIN_SDCARD)
+    BUILTIN_SDCARD;
+  #else
+    10;
+  #endif
+static char recFilename[32] = "flightlog.csv";
 void recordUpdate();
+
+// SD helper functions
+bool initSD() {
+  #if defined(BUILTIN_SDCARD)
+    if (SD.begin(BUILTIN_SDCARD)) return true;
+  #else
+    if (SD.begin(SD_CS_PIN)) return true;
+  #endif
+  return false;
+}
+
+bool recOpenFile() {
+  if (!sdAvailable) return false;
+  // open or create file
+  recFile = SD.open(recFilename, FILE_WRITE);
+  if (!recFile) return false;
+  // write header if empty
+  if (recFile.size() == 0) {
+    recFile.println("t_ms,roll,pitch,yaw,thro,ch1,ch2,ch3,ch4,m1,m2,m3,m4,m5,m6");
+    recFile.flush();
+  }
+  return true;
+}
+
+void recCloseFile() {
+  if (recFile) { recFile.close(); }
+}
+
+bool initSD();
+bool recOpenFile();
+void recCloseFile();
 
 // ------------------ Simple anomaly detector (placeholder TFLM hook) ------------------
 static bool anomalyFlag = false;
 static float anomalyScore = 0.0f;
+
+// TinyML / TFLM integration flag + stubs
+#ifndef USE_TFLM
+  #define USE_TFLM 0
+#endif
+static bool tflmEnabled = false;
+void initTFLM();
+float runTFLMAnomalyDetector();
 void detectAnomalies();
 
 // ------------------ Auto-optimization telemetry (offboard) ------------------
@@ -378,6 +429,9 @@ void setup() {
   prev_time = current_time;
   // Load saved PID and tune parameters from EEPROM (if present)
   loadParametersFromEEPROM();
+  // Try SD init (optional)
+  sdAvailable = initSD();
+  if (sdAvailable) Serial.println("SD: available"); else Serial.println("SD: not available");
   delay(3000); //3 second delay for plugging in battery before IMU calibration begins, feel free to comment this out to reduce boot time
   
   //Initialize all pins
@@ -1803,7 +1857,7 @@ void handleSerialCommands() {
     }
   }
 
-  // RECORDER: REC START / REC STOP / REC RATE <Hz>
+  // RECORDER: REC START / REC STOP / REC RATE <Hz> / REC SD START / REC SD STOP / REC SD FILE <name>
   if (cmd.equalsIgnoreCase("REC START")) { recRecording = true; recLastTime = micros(); Serial.println("REC STARTED"); return; }
   if (cmd.equalsIgnoreCase("REC STOP")) { recRecording = false; Serial.println("REC STOPPED"); return; }
   if (cmd.startsWith("REC RATE ")) {
@@ -1811,6 +1865,10 @@ void handleSerialCommands() {
     int hz = v.toInt(); if (hz < 1) hz = 1; if (hz > 500) hz = 500;
     recIntervalUs = 1000000UL / hz; Serial.print("OK REC RATE "); Serial.println(hz); return;
   }
+  if (cmd.equalsIgnoreCase("REC SD START")) { if (!sdAvailable) { Serial.println("ERR SD NOT AVAILABLE"); } else { recRecordingSD = true; recOpenFile(); Serial.println("REC SD STARTED"); } return; }
+  if (cmd.equalsIgnoreCase("REC SD STOP")) { recRecordingSD = false; recCloseFile(); Serial.println("REC SD STOPPED"); return; }
+  if (cmd.startsWith("REC SD FILE ")) { String n = cmd.substring(12); n.trim(); if (n.length() > 0 && n.length() < 32) { n.toCharArray(recFilename, 32); Serial.print("OK REC SD FILE "); Serial.println(recFilename); } else Serial.println("ERR filename"); return; }
+
 
   // AUTOOPT telemetry stream for offboard optimization
   if (cmd.equalsIgnoreCase("AUTOOPT START")) { autooptRunning = true; autooptLast = micros(); Serial.println("AUTOOPT STARTED"); return; }
@@ -1823,6 +1881,37 @@ void handleSerialCommands() {
   // MAVBRIDGE (fallback simple MAVLink-like JSON bridge)
   if (cmd.equalsIgnoreCase("MAVBRIDGE START")) { mavlinkBridgeEnabled = true; Serial.println("MAVBRIDGE STARTED"); return; }
   if (cmd.equalsIgnoreCase("MAVBRIDGE STOP")) { mavlinkBridgeEnabled = false; Serial.println("MAVBRIDGE STOPPED"); return; }
+
+  // TinyML (TFLM) controls (stub)
+  if (cmd.equalsIgnoreCase("TFLM ENABLE")) { tflmEnabled = true; initTFLM(); Serial.println("TFLM ENABLED"); return; }
+  if (cmd.equalsIgnoreCase("TFLM DISABLE")) { tflmEnabled = false; Serial.println("TFLM DISABLED"); return; }
+  if (cmd.equalsIgnoreCase("TFLM LOAD")) { Serial.println("TFLM LOAD: stub - add model and enable USE_TFLM at build"); return; }
+
+  // Apply gains from offboard optimizer (APPLY_GAINS AXIS Kp Ki Kd)
+  if (cmd.startsWith("APPLY_GAINS ")) {
+    // format: APPLY_GAINS ROLL 0.2 0.3 0.05
+    int sp = cmd.indexOf(' ');
+    String rest = cmd.substring(sp + 1);
+    rest.trim();
+    int sp2 = rest.indexOf(' ');
+    if (sp2 < 0) { Serial.println("ERR bad APPLY_GAINS"); return; }
+    String axis = rest.substring(0, sp2);
+    String params = rest.substring(sp2 + 1);
+    float kp=0, ki=0, kd=0;
+    int p1 = params.indexOf(' ');
+    if (p1 > 0) {
+      kp = params.substring(0, p1).toFloat();
+      int p2 = params.indexOf(' ', p1+1);
+      if (p2 > 0) {
+        ki = params.substring(p1+1, p2).toFloat();
+        kd = params.substring(p2+1).toFloat();
+      }
+    }
+    if (axis.equalsIgnoreCase("ROLL")) { Kp_roll_angle = kp; Ki_roll_angle = ki; Kd_roll_angle = kd; saveParametersToEEPROM(); Serial.println("OK APPLY_GAINS ROLL"); return; }
+    if (axis.equalsIgnoreCase("PITCH")) { Kp_pitch_angle = kp; Ki_pitch_angle = ki; Kd_pitch_angle = kd; saveParametersToEEPROM(); Serial.println("OK APPLY_GAINS PITCH"); return; }
+    Serial.println("ERR unknown axis");
+    return;
+  }
 
   Serial.println("ERR unknown command");
 }
@@ -2173,33 +2262,77 @@ void autotuneUpdate() {
 
 // ---------------------- Flight-data recorder (serial CSV) ------------------
 void recordUpdate() {
-  if (!recRecording) return;
   unsigned long now = micros();
   if ((now - recLastTime) < recIntervalUs) return;
   recLastTime = now;
-  // CSV: t_ms,roll,pitch,yaw,thro,ch1,ch2,ch3,ch4,m1..m6
-  Serial.print("REC,"); Serial.print(millis()); Serial.print(',');
-  Serial.print(roll_IMU); Serial.print(','); Serial.print(pitch_IMU); Serial.print(','); Serial.print(yaw_IMU); Serial.print(',');
-  Serial.print(thro_des); Serial.print(','); Serial.print(channel_1_pwm); Serial.print(','); Serial.print(channel_2_pwm); Serial.print(',');
-  Serial.print(channel_3_pwm); Serial.print(','); Serial.print(channel_4_pwm);
-  Serial.print(','); Serial.print(m1_command_PWM); Serial.print(','); Serial.print(m2_command_PWM); Serial.print(',');
-  Serial.print(m3_command_PWM); Serial.print(','); Serial.print(m4_command_PWM); Serial.print(','); Serial.print(m5_command_PWM); Serial.print(','); Serial.println(m6_command_PWM);
+
+  if (recRecording) {
+    // serial CSV: t_ms,roll,pitch,yaw,thro,ch1,ch2,ch3,ch4,m1..m6
+    Serial.print("REC,"); Serial.print(millis()); Serial.print(',');
+    Serial.print(roll_IMU); Serial.print(','); Serial.print(pitch_IMU); Serial.print(','); Serial.print(yaw_IMU); Serial.print(',');
+    Serial.print(thro_des); Serial.print(','); Serial.print(channel_1_pwm); Serial.print(','); Serial.print(channel_2_pwm); Serial.print(',');
+    Serial.print(channel_3_pwm); Serial.print(','); Serial.print(channel_4_pwm);
+    Serial.print(','); Serial.print(m1_command_PWM); Serial.print(','); Serial.print(m2_command_PWM); Serial.print(',');
+    Serial.print(m3_command_PWM); Serial.print(','); Serial.print(m4_command_PWM); Serial.print(','); Serial.print(m5_command_PWM); Serial.print(','); Serial.println(m6_command_PWM);
+  }
+
+  if (recRecordingSD && sdAvailable) {
+    if (!recFile) {
+      if (!recOpenFile()) { recRecordingSD = false; return; }
+    }
+    // CSV line
+    recFile.print(millis()); recFile.print(',');
+    recFile.print(roll_IMU); recFile.print(','); recFile.print(pitch_IMU); recFile.print(','); recFile.print(yaw_IMU); recFile.print(',');
+    recFile.print(thro_des); recFile.print(','); recFile.print(channel_1_pwm); recFile.print(','); recFile.print(channel_2_pwm); recFile.print(',');
+    recFile.print(channel_3_pwm); recFile.print(','); recFile.print(channel_4_pwm);
+    recFile.print(','); recFile.print(m1_command_PWM); recFile.print(','); recFile.print(m2_command_PWM); recFile.print(',');
+    recFile.print(m3_command_PWM); recFile.print(','); recFile.print(m4_command_PWM); recFile.print(','); recFile.print(m5_command_PWM); recFile.print(','); recFile.println(m6_command_PWM);
+    recFile.flush();
+  }
 }
 
 // ---------------------- Simple anomaly detector (placeholder) ------------------
+void initTFLM() {
+#if USE_TFLM
+  // Placeholder: initialize TFLM runtime and load model
+  // Real implementation: add TFLM library, provide model array, allocate arena, and set up interpreter
+  Serial.println("TFLM: initialized (stub)");
+#else
+  Serial.println("TFLM: not enabled at build time");
+#endif
+}
+
+float runTFLMAnomalyDetector() {
+#if USE_TFLM
+  // Real inference would go here — return normalized anomaly score [0..1]
+  return 0.0f; // stub
+#else
+  return 0.0f; // stub
+#endif
+}
+
 void detectAnomalies() {
   anomalyScore = 0.0f; anomalyFlag = false;
-  // gyro spike
-  if (fabs(GyroX) > 1000.0f || fabs(GyroY) > 1000.0f || fabs(GyroZ) > 1000.0f) { anomalyScore += 0.6f; }
-  // accel spike
-  if (fabs(AccX) > 4.0f || fabs(AccY) > 4.0f || fabs(AccZ) > 6.0f) { anomalyScore += 0.6f; }
-  // motor saturation without attitude change (simple heuristic)
+
+  // run TinyML model if enabled (placeholder)
+  if (tflmEnabled) {
+    float s = runTFLMAnomalyDetector();
+    if (s > anomalyScore) anomalyScore = s;
+  }
+
+  // fallback heuristics
+  if (fabs(GyroX) > 1000.0f || fabs(GyroY) > 1000.0f || fabs(GyroZ) > 1000.0f) { anomalyScore = max(anomalyScore, 0.6f); }
+  if (fabs(AccX) > 4.0f || fabs(AccY) > 4.0f || fabs(AccZ) > 6.0f) { anomalyScore = max(anomalyScore, 0.6f); }
   if (thro_des > 0.5f) {
     if ((m1_command_PWM > 230 || m2_command_PWM > 230 || m3_command_PWM > 230 || m4_command_PWM > 230) && (fabs(roll_IMU) < 0.5f && fabs(pitch_IMU) < 0.5f)) {
-      anomalyScore += 0.4f;
+      anomalyScore = max(anomalyScore, 0.4f);
     }
   }
-  if (anomalyScore > 0.3f) { anomalyFlag = true; Serial.print("ALERT:ANOMALY score="); Serial.println(anomalyScore); }
+
+  if (anomalyScore > 0.3f) {
+    anomalyFlag = true;
+    Serial.print("ALERT:ANOMALY score="); Serial.println(anomalyScore);
+  }
 }
 
 // ---------------------- Auto-opt telemetry (high-rate streaming) ------------------
@@ -2221,9 +2354,28 @@ void mavlinkBridgeSendHeartbeat() {
   static unsigned long lastHb = 0;
   if (micros() - lastHb < 1000000UL) return; // 1 Hz
   lastHb = micros();
-  Serial.print("MAVLINK,HEARTBEAT,"); Serial.print(millis()); Serial.println();
-  // also send attitude
-  Serial.print("MAVLINK,ATTITUDE,\""); Serial.print(roll_IMU); Serial.print("\","); Serial.print(pitch_IMU); Serial.print(","); Serial.println(yaw_IMU);
+
+  // If the user has the MAVLink C library available and defines USE_MAVLINK_LIB at build time,
+  // send native MAVLink messages. Otherwise fall back to the JSON bridge already implemented.
+  #if defined(USE_MAVLINK_LIB)
+    // native MAVLink v2 heartbeat + attitude (requires mavlink headers in include path)
+    mavlink_message_t msg;
+    uint8_t buf[300];
+    // HEARTBEAT: type=6 (MAV_TYPE_GENERIC), autopilot=8 (MAV_AUTOPILOT_GENERIC), base_mode=0, custom_mode=0, system_status=4
+    mavlink_msg_heartbeat_pack(1, 1, &msg, MAV_TYPE_GENERIC, MAV_AUTOPILOT_GENERIC, 0, 0, MAV_STATE_ACTIVE);
+    uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+    Serial.write(buf, len);
+
+    // Attitude message (roll, pitch, yaw in radians)
+    mavlink_msg_attitude_pack(1, 1, &msg, millis(), roll_IMU * 0.0174532925f, pitch_IMU * 0.0174532925f, yaw_IMU * 0.0174532925f, GyroX * 0.0174532925f, GyroY * 0.0174532925f, GyroZ * 0.0174532925f);
+    len = mavlink_msg_to_send_buffer(buf, &msg);
+    Serial.write(buf, len);
+  #else
+    // Fallback JSON-based bridge (compatible with simple offboard tools)
+    Serial.print("MAVLINK,HEARTBEAT,"); Serial.print(millis()); Serial.println();
+    // also send attitude
+    Serial.print("MAVLINK,ATTITUDE,"); Serial.print(roll_IMU); Serial.print(','); Serial.print(pitch_IMU); Serial.print(','); Serial.println(yaw_IMU);
+  #endif
 }
 
 
