@@ -15,7 +15,10 @@ import random
 import time
 import re
 from collections import deque
-import serial
+try:
+    import serial
+except Exception:
+    serial = None
 
 OPT_PREFIX = 'OPT,'
 REC_PREFIX = 'REC,'
@@ -28,7 +31,7 @@ APPLY_FMT = 'APPLY_GAINS {axis} {kp} {ki} {kd}\n'
 
 def parse_args():
     p = argparse.ArgumentParser(description='Simple evolutionary optimizer for dRehmFlight')
-    p.add_argument('--port', required=True)
+    p.add_argument('--port', required=False, help='serial port (not required in --simulate)')
     p.add_argument('--baud', type=int, default=500000)
     p.add_argument('--axis', choices=['ROLL','PITCH','BOTH'], default='ROLL')
     p.add_argument('--window', type=float, default=3.0, help='seconds to evaluate each candidate')
@@ -42,6 +45,7 @@ def parse_args():
     p.add_argument('--tol', type=float, default=1e-4, help='minimum relative improvement to count')
     p.add_argument('--patience', type=int, default=6, help='generations without improvement before early stop')
     p.add_argument('--include-motors', action='store_true', help='include motor saturation in cost if REC/OPT contains motor fields')
+    p.add_argument('--simulate', action='store_true', help='run in simulation (no serial required)')
     return p.parse_args()
 
 
@@ -52,7 +56,9 @@ def read_json_line(line):
         return None
 
 
-def get_pid(ser, timeout=1.0):
+def get_pid(ser=None, timeout=1.0, simulate=False):
+    if simulate:
+        return {'Kp_roll_angle':0.2,'Ki_roll_angle':0.3,'Kd_roll_angle':0.05,'Kp_pitch_angle':0.2,'Ki_pitch_angle':0.3,'Kd_pitch_angle':0.05}
     ser.reset_input_buffer()
     ser.write(GET_PID.encode())
     t0 = time.time()
@@ -68,10 +74,19 @@ def get_pid(ser, timeout=1.0):
     return None
 
 
-def evaluate_cost(ser, duration):
+def evaluate_cost(ser, duration, simulate=False, pid=None):
     """Collect OPT or REC telemetry for `duration` seconds and compute a simple cost.
+    In simulate mode returns a deterministic synthetic cost based on PID vector.
     Cost = mean(|roll| + |pitch|) over samples (lower is better)
     """
+    if simulate:
+        # synthetic objective: quadratic bowl around slightly lower-than-initial gains
+        if pid is None:
+            pid = {'Kp_roll_angle':0.2,'Ki_roll_angle':0.3,'Kd_roll_angle':0.05}
+        x = [pid.get('Kp_roll_angle',0.2), pid.get('Ki_roll_angle',0.3), pid.get('Kd_roll_angle',0.05)]
+        # return a simple scalar cost
+        return sum((xi - xi*0.9)**2 for xi in x)
+
     t0 = time.time()
     samples = []
     ser.timeout = 0.2
@@ -104,8 +119,14 @@ def evaluate_cost(ser, duration):
     return sum(samples) / len(samples)
 
 
-def apply_and_evaluate(ser, axis, kp, ki, kd, duration, timeout=0.2):
-    """Apply gains (APPLY_GAINS) and return evaluated cost over duration seconds."""
+def apply_and_evaluate(ser, axis, kp, ki, kd, duration, timeout=0.2, simulate=False, pid=None):
+    """Apply gains (APPLY_GAINS) and return evaluated cost over duration seconds.
+    Supports simulate mode (no serial required).
+    """
+    if simulate:
+        # synthetic objective based on provided pid (or defaults)
+        fake_pid = pid if pid is not None else {'Kp_roll_angle':kp, 'Ki_roll_angle':ki, 'Kd_roll_angle':kd}
+        return evaluate_cost(None, duration, simulate=True, pid=fake_pid)
     cmd = APPLY_FMT.format(axis=axis, kp=kp, ki=ki, kd=kd)
     ser.write(cmd.encode())
     time.sleep(0.25)
@@ -128,9 +149,13 @@ def _append_csv_row(path, row, header=None):
 
 def main():
     args = parse_args()
-    ser = serial.Serial(args.port, args.baud, timeout=0.2)
-    time.sleep(1.0)
-    pid = get_pid(ser)
+    simulate = args.simulate
+    ser = None
+    if not simulate:
+        import serial as _serial
+        ser = _serial.Serial(args.port, args.baud, timeout=0.2)
+        time.sleep(1.0)
+    pid = get_pid(ser, simulate=simulate)
     if not pid:
         print('Failed to read PID (GET PID), aborting')
         return
@@ -139,12 +164,13 @@ def main():
     # make best dict flexible for BOTH
     best = pid.copy()
 
-    # start OPT stream
-    ser.write(b'AUTOOPT START\n')
-    time.sleep(0.1)
+    # start OPT stream (no-op in simulate)
+    if not simulate:
+        ser.write(b'AUTOOPT START\n')
+        time.sleep(0.1)
 
     # baseline
-    baseline = evaluate_cost(ser, args.window)
+    baseline = evaluate_cost(ser, args.window, simulate=simulate, pid=pid)
     best_cost = baseline
     print('Baseline cost:', baseline)
 
@@ -199,20 +225,25 @@ def main():
                 # apply candidate(s) and evaluate
                 if args.axis == 'BOTH':
                     # apply pitch then roll (APPLY_GAINS accepts axis-specific)
-                    ser.write(APPLY_FMT.format(axis='ROLL', kp=kp_r, ki=ki_r, kd=kd_r).encode())
-                    time.sleep(0.05)
-                    ser.write(APPLY_FMT.format(axis='PITCH', kp=kp_p, ki=ki_p, kd=kd_p).encode())
-                    time.sleep(0.2)
-                    cost = evaluate_cost(ser, args.window)
+                    if simulate:
+                        # synthetic cost based on roll candidate (use roll part as representative)
+                        fake_pid_candidate = {'Kp_roll_angle':kp_r, 'Ki_roll_angle':ki_r, 'Kd_roll_angle':kd_r}
+                        cost = evaluate_cost(None, args.window, simulate=True, pid=fake_pid_candidate)
+                    else:
+                        ser.write(APPLY_FMT.format(axis='ROLL', kp=kp_r, ki=ki_r, kd=kd_r).encode())
+                        time.sleep(0.05)
+                        ser.write(APPLY_FMT.format(axis='PITCH', kp=kp_p, ki=ki_p, kd=kd_p).encode())
+                        time.sleep(0.2)
+                        cost = evaluate_cost(ser, args.window)
                     cand_kp, cand_ki, cand_kd = kp_r, ki_r, kd_r
                     cand_axis = 'BOTH'
                 else:
                     cand_axis = args.axis
                     if cand_axis == 'ROLL':
-                        cost = apply_and_evaluate(ser, 'ROLL', kp_r, ki_r, kd_r, args.window)
+                        cost = apply_and_evaluate(ser, 'ROLL', kp_r, ki_r, kd_r, args.window, simulate=simulate, pid=pid)
                         cand_kp, cand_ki, cand_kd = kp_r, ki_r, kd_r
                     else:
-                        cost = apply_and_evaluate(ser, 'PITCH', kp_p, ki_p, kd_p, args.window)
+                        cost = apply_and_evaluate(ser, 'PITCH', kp_p, ki_p, kd_p, args.window, simulate=simulate, pid=pid)
                         cand_kp, cand_ki, cand_kd = kp_p, ki_p, kd_p
 
                 ts = int(time.time())
@@ -243,14 +274,17 @@ def main():
                         best['Kp_pitch_angle'] = generation_best['kp']
                         best['Ki_pitch_angle'] = generation_best['ki']
                         best['Kd_pitch_angle'] = generation_best['kd']
-                # persist to flight controller
-                if generation_best['axis'] in ('ROLL', 'BOTH'):
-                    ser.write(APPLY_FMT.format(axis='ROLL', kp=best['Kp_roll_angle'], ki=best['Ki_roll_angle'], kd=best['Kd_roll_angle']).encode())
-                    time.sleep(0.05)
-                if generation_best['axis'] in ('PITCH', 'BOTH'):
-                    ser.write(APPLY_FMT.format(axis='PITCH', kp=best['Kp_pitch_angle'], ki=best['Ki_pitch_angle'], kd=best['Kd_pitch_angle']).encode())
-                    time.sleep(0.05)
-                ser.write(SAVE_CMD.encode())
+                # persist to flight controller (skip in simulate)
+                if not simulate:
+                    if generation_best['axis'] in ('ROLL', 'BOTH'):
+                        ser.write(APPLY_FMT.format(axis='ROLL', kp=best['Kp_roll_angle'], ki=best['Ki_roll_angle'], kd=best['Kd_roll_angle']).encode())
+                        time.sleep(0.05)
+                    if generation_best['axis'] in ('PITCH', 'BOTH'):
+                        ser.write(APPLY_FMT.format(axis='PITCH', kp=best['Kp_pitch_angle'], ki=best['Ki_pitch_angle'], kd=best['Kd_pitch_angle']).encode())
+                        time.sleep(0.05)
+                    ser.write(SAVE_CMD.encode())
+                else:
+                    print('SIMULATE: would SAVE PARAMS to FC')
                 print(f'Generation {it} -> improvement accepted (best_cost={best_cost:.5f})')
                 no_improve = 0
             else:
@@ -274,8 +308,11 @@ def main():
         print('Optimization finished. Best cost=', best_cost)
         print('Best PID:', best)
     finally:
-        ser.write(b'AUTOOPT STOP\n')
-        ser.close()
+        if not simulate and ser:
+            ser.write(b'AUTOOPT STOP\n')
+            ser.close()
+        else:
+            print('SIMULATE: AUTOOPT STOP')
 
 if __name__ == '__main__':
     main()

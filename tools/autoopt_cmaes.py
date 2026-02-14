@@ -14,7 +14,10 @@ import math
 import random
 import time
 import json
-import serial
+try:
+    import serial
+except Exception:
+    serial = None
 import os
 
 OPT_PREFIX = 'OPT,'
@@ -31,7 +34,9 @@ def read_json_line(line):
         return None
 
 
-def get_pid(ser, timeout=1.0):
+def get_pid(ser=None, timeout=1.0, simulate=False):
+    if simulate:
+        return {'Kp_roll_angle':0.2,'Ki_roll_angle':0.3,'Kd_roll_angle':0.05,'Kp_pitch_angle':0.2,'Ki_pitch_angle':0.3,'Kd_pitch_angle':0.05}
     ser.reset_input_buffer()
     ser.write(GET_PID.encode())
     t0 = time.time()
@@ -45,7 +50,15 @@ def get_pid(ser, timeout=1.0):
     return None
 
 
-def evaluate_cost(ser, duration):
+def evaluate_cost(ser, duration, simulate=False, pid=None, candidate=None):
+    if simulate:
+        # simple synthetic cost: quadratic distance from 'good' gains (90% of pid)
+        if pid is None:
+            pid = {'Kp_roll_angle':0.2,'Ki_roll_angle':0.3,'Kd_roll_angle':0.05}
+        if candidate is None:
+            candidate = [pid['Kp_roll_angle'], pid['Ki_roll_angle'], pid['Kd_roll_angle']]
+        return sum((candidate[i] - (list(pid.values())[i]*0.9))**2 for i in range(len(candidate)))
+
     t0 = time.time()
     samples = []
     ser.timeout = 0.25
@@ -85,9 +98,13 @@ def _append_csv_row(path, row, header=None):
 
 
 def cmales_optimize(args):
-    ser = serial.Serial(args.port, args.baud, timeout=0.2)
-    time.sleep(1.0)
-    pid = get_pid(ser)
+    simulate = getattr(args, 'simulate', False)
+    ser = None
+    if not simulate:
+        import serial as _serial
+        ser = _serial.Serial(args.port, args.baud, timeout=0.2)
+        time.sleep(1.0)
+    pid = get_pid(ser, simulate=simulate)
     if not pid:
         print('Failed to read PID (GET PID), aborting')
         return
@@ -124,8 +141,9 @@ def cmales_optimize(args):
     best_cost = float('inf')
     best_params = list(m)
 
-    ser.write(b'AUTOOPT START\n')
-    time.sleep(0.1)
+    if not simulate and ser:
+        ser.write(b'AUTOOPT START\n')
+        time.sleep(0.1)
 
     csv_header = 'ts,gen,idx,cost,params'
 
@@ -146,18 +164,28 @@ def cmales_optimize(args):
         for idx, (x, y) in enumerate(offspring):
             # apply to flight controller (axis-wise)
             if args.axis == 'ROLL':
-                cmd = APPLY_FMT.format(axis='ROLL', kp=x[0], ki=x[1], kd=x[2])
-                ser.write(cmd.encode()); time.sleep(0.05)
+                if simulate:
+                    cost = evaluate_cost(None, args.window, simulate=True, pid=pid, candidate=x[:3])
+                else:
+                    cmd = APPLY_FMT.format(axis='ROLL', kp=x[0], ki=x[1], kd=x[2])
+                    ser.write(cmd.encode()); time.sleep(0.05)
+                    cost = evaluate_cost(ser, args.window)
             elif args.axis == 'PITCH':
-                cmd = APPLY_FMT.format(axis='PITCH', kp=x[0], ki=x[1], kd=x[2])
-                ser.write(cmd.encode()); time.sleep(0.05)
+                if simulate:
+                    cost = evaluate_cost(None, args.window, simulate=True, pid=pid, candidate=x[:3])
+                else:
+                    cmd = APPLY_FMT.format(axis='PITCH', kp=x[0], ki=x[1], kd=x[2])
+                    ser.write(cmd.encode()); time.sleep(0.05)
+                    cost = evaluate_cost(ser, args.window)
             else:  # BOTH
-                cmd1 = APPLY_FMT.format(axis='ROLL', kp=x[0], ki=x[1], kd=x[2])
-                cmd2 = APPLY_FMT.format(axis='PITCH', kp=x[3], ki=x[4], kd=x[5])
-                ser.write(cmd1.encode()); time.sleep(0.02)
-                ser.write(cmd2.encode()); time.sleep(0.05)
-
-            cost = evaluate_cost(ser, args.window)
+                if simulate:
+                    cost = evaluate_cost(None, args.window, simulate=True, pid=pid, candidate=x[:3])
+                else:
+                    cmd1 = APPLY_FMT.format(axis='ROLL', kp=x[0], ki=x[1], kd=x[2])
+                    cmd2 = APPLY_FMT.format(axis='PITCH', kp=x[3], ki=x[4], kd=x[5])
+                    ser.write(cmd1.encode()); time.sleep(0.02)
+                    ser.write(cmd2.encode()); time.sleep(0.05)
+                    cost = evaluate_cost(ser, args.window)
             print(f'Gen {gen} cand {idx+1}/{lam} cost={cost:.5f}')
             _append_csv_row(args.log_file, [int(time.time()), gen, idx+1, cost, x], header=csv_header)
             results.append((cost, x, y))
@@ -204,25 +232,29 @@ def cmales_optimize(args):
             best_cost = gen_best_cost
             best_params = list(gen_best_params)
             print(f'Gen {gen} -> new best cost={best_cost:.5f} (saving to FC)')
-            # persist to FC
-            if args.axis == 'ROLL':
-                ser.write(APPLY_FMT.format(axis='ROLL', kp=best_params[0], ki=best_params[1], kd=best_params[2]).encode())
-            elif args.axis == 'PITCH':
-                ser.write(APPLY_FMT.format(axis='PITCH', kp=best_params[0], ki=best_params[1], kd=best_params[2]).encode())
+            # persist to FC (skip in simulate)
+            if not simulate and ser:
+                if args.axis == 'ROLL':
+                    ser.write(APPLY_FMT.format(axis='ROLL', kp=best_params[0], ki=best_params[1], kd=best_params[2]).encode())
+                elif args.axis == 'PITCH':
+                    ser.write(APPLY_FMT.format(axis='PITCH', kp=best_params[0], ki=best_params[1], kd=best_params[2]).encode())
+                else:
+                    ser.write(APPLY_FMT.format(axis='ROLL', kp=best_params[0], ki=best_params[1], kd=best_params[2]).encode()); time.sleep(0.02)
+                    ser.write(APPLY_FMT.format(axis='PITCH', kp=best_params[3], ki=best_params[4], kd=best_params[5]).encode())
+                ser.write(SAVE_CMD.encode())
             else:
-                ser.write(APPLY_FMT.format(axis='ROLL', kp=best_params[0], ki=best_params[1], kd=best_params[2]).encode()); time.sleep(0.02)
-                ser.write(APPLY_FMT.format(axis='PITCH', kp=best_params[3], ki=best_params[4], kd=best_params[5]).encode())
-            ser.write(SAVE_CMD.encode())
+                print('SIMULATE: would SAVE best_params to FC')
 
-    ser.write(b'AUTOOPT STOP\n')
-    ser.close()
+    if not simulate and ser:
+        ser.write(b'AUTOOPT STOP\n')
+        ser.close()
     print('CMA-ES optimization finished. Best cost=', best_cost)
     print('Best params =', best_params)
 
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
-    p.add_argument('--port', required=True)
+    p.add_argument('--port', required=False)
     p.add_argument('--baud', type=int, default=500000)
     p.add_argument('--axis', choices=['ROLL','PITCH','BOTH'], default='ROLL')
     p.add_argument('--iters', type=int, default=40)
@@ -232,5 +264,6 @@ if __name__ == '__main__':
     p.add_argument('--min-gain', type=float, default=0.0)
     p.add_argument('--max-gain', type=float, default=5.0)
     p.add_argument('--log-file', default='tools/autoopt_cmaes_results.csv')
+    p.add_argument('--simulate', action='store_true', help='run in simulation mode (no FC)')
     args = p.parse_args()
     cmales_optimize(args)
