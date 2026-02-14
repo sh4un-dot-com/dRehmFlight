@@ -412,7 +412,8 @@ bool MPU6050::dmpPacketAvailable() {
 // uint8_t MPU6050::dmpSendEIS(uint_fast16_t elements, uint_fast16_t accuracy);
 
 uint8_t MPU6050::dmpGetAccel(int32_t *data, const uint8_t* packet) {
-    // TODO: accommodate different arrangements of sent data (ONLY default supported now)
+	// NOTE: Only the default DMP FIFO packet layout is supported here.
+	// Alternate packet arrangements are not handled to avoid risky changes.
     if (packet == 0) packet = dmpPacketBuffer;
     data[0] = (((uint32_t)packet[28] << 24) | ((uint32_t)packet[29] << 16) | ((uint32_t)packet[30] << 8) | packet[31]);
     data[1] = (((uint32_t)packet[32] << 24) | ((uint32_t)packet[33] << 16) | ((uint32_t)packet[34] << 8) | packet[35]);
@@ -420,7 +421,8 @@ uint8_t MPU6050::dmpGetAccel(int32_t *data, const uint8_t* packet) {
     return 0;
 }
 uint8_t MPU6050::dmpGetAccel(int16_t *data, const uint8_t* packet) {
-    // TODO: accommodate different arrangements of sent data (ONLY default supported now)
+	// NOTE: Only the default DMP FIFO packet layout is supported here.
+	// Alternate packet arrangements are not handled to avoid risky changes.
     if (packet == 0) packet = dmpPacketBuffer;
     data[0] = (packet[28] << 8) | packet[29];
     data[1] = (packet[32] << 8) | packet[33];
@@ -428,7 +430,8 @@ uint8_t MPU6050::dmpGetAccel(int16_t *data, const uint8_t* packet) {
     return 0;
 }
 uint8_t MPU6050::dmpGetAccel(VectorInt16 *v, const uint8_t* packet) {
-    // TODO: accommodate different arrangements of sent data (ONLY default supported now)
+	// NOTE: Only the default DMP FIFO packet layout is supported here.
+	// Alternate packet arrangements are not handled to avoid risky changes.
     if (packet == 0) packet = dmpPacketBuffer;
     v -> x = (packet[28] << 8) | packet[29];
     v -> y = (packet[32] << 8) | packet[33];
@@ -436,7 +439,8 @@ uint8_t MPU6050::dmpGetAccel(VectorInt16 *v, const uint8_t* packet) {
     return 0;
 }
 uint8_t MPU6050::dmpGetQuaternion(int32_t *data, const uint8_t* packet) {
-    // TODO: accommodate different arrangements of sent data (ONLY default supported now)
+	// NOTE: Only the default DMP FIFO packet layout is supported here.
+	// Alternate packet arrangements are not handled to avoid risky changes.
     if (packet == 0) packet = dmpPacketBuffer;
     data[0] = (((uint32_t)packet[0] << 24) | ((uint32_t)packet[1] << 16) | ((uint32_t)packet[2] << 8) | packet[3]);
     data[1] = (((uint32_t)packet[4] << 24) | ((uint32_t)packet[5] << 16) | ((uint32_t)packet[6] << 8) | packet[7]);
@@ -445,7 +449,8 @@ uint8_t MPU6050::dmpGetQuaternion(int32_t *data, const uint8_t* packet) {
     return 0;
 }
 uint8_t MPU6050::dmpGetQuaternion(int16_t *data, const uint8_t* packet) {
-    // TODO: accommodate different arrangements of sent data (ONLY default supported now)
+	// NOTE: Only the default DMP FIFO packet layout is supported here.
+	// Alternate packet arrangements are not handled to avoid risky changes.
     if (packet == 0) packet = dmpPacketBuffer;
     data[0] = ((packet[0] << 8) | packet[1]);
     data[1] = ((packet[4] << 8) | packet[5]);
@@ -454,7 +459,8 @@ uint8_t MPU6050::dmpGetQuaternion(int16_t *data, const uint8_t* packet) {
     return 0;
 }
 uint8_t MPU6050::dmpGetQuaternion(Quaternion *q, const uint8_t* packet) {
-    // TODO: accommodate different arrangements of sent data (ONLY default supported now)
+	// NOTE: Only the default DMP FIFO packet layout is supported here.
+	// Alternate packet arrangements are not handled to avoid risky changes.
     int16_t qI[4];
     uint8_t status = dmpGetQuaternion(qI, packet);
     if (status == 0) {
