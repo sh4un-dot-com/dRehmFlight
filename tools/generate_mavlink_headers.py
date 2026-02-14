@@ -4,11 +4,19 @@ Helper: attempt to generate MAVLink C headers for use in the firmware.
   this script prints instructions for the user to add MAVLink headers manually.
 
 Note: This script does not add headers automatically to the repo; it helps automation
-when running locally with `pymavlink` installed.
+when running locally with `pymavlink` installed. This helper is intentionally
+non-fatal: the repository includes a minimal stub at `src/Mavlink/gen/mavlink.h`.
 """
 import argparse
-import shutil
 import os
+
+def print_instructions(out):
+    print('pymavlink not available or generation failed.')
+    print('Install pymavlink locally and run this script to generate headers:')
+    print('  pip install pymavlink')
+    print('  python tools/generate_mavlink_headers.py --out', out)
+    print('Or copy generated headers into', out)
+    print('A minimal stub header is already present at src/Mavlink/gen/mavlink.h')
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
@@ -17,17 +25,25 @@ if __name__ == '__main__':
     args = p.parse_args()
 
     try:
+        # import lazily to avoid failing in environments without pymavlink
+        import subprocess
         from pymavlink.generator import mavgen
     except Exception as e:
-        print('pymavlink generator not available:', e)
-        raise SystemExit(1)
+        print_instructions(args.out)
+        # Non-fatal: repository ships a minimal stub; allow script to exit cleanly
+        raise SystemExit(0)
 
     print('Generating MAVLink headers for dialect:', args.dialect)
-    # Use mavgen command
-    cmd = [sys.executable, '-c', 'import sys; sys.path.insert(0, \"C:\\\\Users\\\\shaun\\\\scoop\\\\apps\\\\python313\\\\current\\\\Lib\\\\site-packages\"); from pymavlink.generator.mavgen import mavgen; mavgen(\"' + args.dialect + '\", language=\"C\", output=\"' + args.out + '\")']
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode == 0:
+    try:
+        os.makedirs(args.out, exist_ok=True)
+        # Call mavgen API; different pymavlink versions may expose different signatures
+        try:
+            mavgen.mavgen(args.dialect, language='C', output=args.out)
+        except TypeError:
+            # fallback: call mavgen directly if module is callable
+            mavgen(args.dialect, language='C', output=args.out)
         print('Generated headers in', args.out)
-    else:
-        print('Failed to generate:', result.stderr)
-        raise SystemExit(1)
+    except Exception as e:
+        print('MAVLink header generation failed:', e)
+        print_instructions(args.out)
+        raise SystemExit(0)

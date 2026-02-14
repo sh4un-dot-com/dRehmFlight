@@ -90,7 +90,7 @@ RcGroups 'jihlein' - IMU implementation overhaul + SBUS implementation
   #include "tensorflow/lite/schema/schema_generated.h"
   #include "tensorflow/lite/version.h"
   // model_data.h must be provided by user when USE_TFLM=1
-  #include "model_data.h"
+  #include "TinyML/model_data.h"
 #endif
 
 // Generated MAVLink headers (common subset) for native MAVLink branch
