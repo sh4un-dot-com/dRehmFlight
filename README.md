@@ -65,3 +65,36 @@ THIS SOFTWARE IS PROVIDED BY THE CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED
 
 [![Hits](https://hits.seeyoufarm.com/api/count/incr/badge.svg?url=https%3A%2F%2Fgithub.com%2Fnickrehm%2FdRehmFlight&count_bg=%23E30F0F&title_bg=%23555555&icon=&icon_color=%23E7E7E7&title=hits&edge_flat=false)](https://hits.seeyoufarm.com)
 
+## Advanced integrations: TinyML (TFLM), native MAVLink, and offboard optimizer
+
+- TinyML (TensorFlow Lite Micro): this repo includes a lightweight C fallback anomaly detector so anomaly detection works out-of-the-box. To run a real TFLM model:
+  1. Add TensorFlow Lite Micro to your Arduino/PlatformIO project (install library or add source files).
+  2. Convert your .tflite model to a C array (e.g. with xxd) and add it as `model_data.h` in the sketch root.
+  3. Build with `-DUSE_TFLM=1` (see PlatformIO sample below).
+  The sketch will automatically use the TFLM runtime when `USE_TFLM` is defined; otherwise it runs the conservative C fallback.
+
+- Native MAVLink: the firmware contains a conditional native MAVLink path. To enable full MAVLink messaging:
+  1. Add MAVLink headers (generate via mavlink generator or install a MAVLink library) and ensure include path is available.
+  2. Build with `-DUSE_MAVLINK_LIB` to enable the native branch. If not defined, a JSON-based MAVBRIDGE fallback is used.
+
+- Offboard optimizer (tools/autoopt_simple_es.py): expanded with population-mode, CSV logging, gain bounds, early-stopping and support for optimizing `ROLL`, `PITCH` or `BOTH`.
+
+### PlatformIO example (quick-start)
+
+Add this to `platformio.ini` or adapt your build system:
+
+[env:teensy40]
+platform = teensy
+board = teensy40
+framework = arduino
+build_flags = -DUSE_TFLM=0  ; set to 1 once you've added model_data.h and TFLM library
+; to enable native MAVLink add: -DUSE_MAVLINK_LIB
+
+
+---
+
+If you'd like, I can (pick one or tell me "all"):
+- Convert a trained anomaly model to `model_data.h` and add it to the repo ✅
+- Add generated MAVLink headers (small subset) so native MAVLink compiles out-of-the-box ✅
+- Add more advanced offboard optimizer (CMA-ES / Bayesian) ✅
+
