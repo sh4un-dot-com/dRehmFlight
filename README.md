@@ -77,7 +77,11 @@ THIS SOFTWARE IS PROVIDED BY THE CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED
   1. Add MAVLink headers (generate via mavlink generator or install a MAVLink library) and ensure include path is available.
   2. Build with `-DUSE_MAVLINK_LIB` to enable the native branch. If not defined, a JSON-based MAVBRIDGE fallback is used.
 
-- Offboard optimizer (tools/autoopt_simple_es.py): expanded with population-mode, CSV logging, gain bounds, early-stopping and support for optimizing `ROLL`, `PITCH` or `BOTH`. New `--method` option supports `es` (default) and a lightweight `cmaes`‑style adaptive-sigma strategy; see script `--help` for details.
+- Offboard optimizers:
+  - `tools/autoopt_simple_es.py` — improved ES with population, adaptive sigma and CSV logging.
+  - `tools/autoopt_cmaes.py` — sep/diag CMA‑ES style optimizer for more robust search.
+  - `tools/autoopt_bayes.py` — surrogate-based Bayesian-style optimizer (EI acquisition) with simulation mode and CSV logging.
+  All optimizers use the serial `APPLY_GAINS` + `AUTOOPT` telemetry flow; use bench testing only (props off).
 
 ### PlatformIO example (quick-start)
 
@@ -87,8 +91,19 @@ Add this to `platformio.ini` or adapt your build system:
 platform = teensy
 board = teensy40
 framework = arduino
-build_flags = -DUSE_TFLM=0  ; set to 1 once you've added model_data.h and TFLM library
-; to enable native MAVLink add: -DUSE_MAVLINK_LIB
+build_flags = -DUSE_TFLM=0  ; set to 1 once you've added a valid model_data.h and TFLM sources
+; to enable native MAVLink add: -DUSE_MAVLINK_LIB (the repo contains a minimal MAVLink stub; replace with real headers if desired)
+
+
+### Tools: converting models & generating MAVLink headers
+- Convert a trained TFLite model into `model_data.h`:
+  python tools/convert_tflite_to_model_data.py path/to/your_model.tflite Versions/dRehmFlight_Teensy_BETA_1.2/model_data.h
+  then build with `-DUSE_TFLM=1`.
+
+- Generate MAVLink headers (local machine with pymavlink):
+  pip install pymavlink
+  python tools/generate_mavlink_headers.py --dialect common --out src/Mavlink/gen
+  Copy generated headers into the sketch include path and build with `-DUSE_MAVLINK_LIB`.
 
 
 ---

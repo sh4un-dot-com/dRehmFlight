@@ -13,7 +13,9 @@ import sys
 import os
 
 CANDIDATES = [
-    # small 'hello_world' style models (may be blocked in some networks)
+    # small 'hello_world' style models
+    'https://github.com/tensorflow/tflite-micro/raw/main/tensorflow/lite/micro/examples/micro_speech/micro_speech.tflite',
+    'https://github.com/tensorflow/tflite-micro/raw/main/tensorflow/lite/micro/examples/hello_world/model.tflite',
     'https://storage.googleapis.com/download.tensorflow.org/models/tflite/micro/hello_world.tflite',
     'https://github.com/tensorflow/examples/raw/master/lite/examples/hello_world/model.tflite',
 ]

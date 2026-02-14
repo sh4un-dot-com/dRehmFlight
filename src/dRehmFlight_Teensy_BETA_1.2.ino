@@ -81,7 +81,7 @@ RcGroups 'jihlein' - IMU implementation overhaul + SBUS implementation
 #include <SD.h>       //SD card logging (optional)
 
 // TinyML fallback model (pure-C) - included by default; real TFLM path is optional at build time
-#include "src/TinyML/simple_model.h"
+#include "TinyML/simple_model.h"
 
 #if USE_TFLM
   // If enabling real TensorFlow Lite Micro, these headers will be used (must add TFLM + model_data to build)
@@ -95,20 +95,19 @@ RcGroups 'jihlein' - IMU implementation overhaul + SBUS implementation
 
 // Generated MAVLink headers (common subset) for native MAVLink branch
 #if defined(USE_MAVLINK_LIB)
-  #include "src/Mavlink/gen/mavlink.h"
+  #include "Mavlink/gen/mavlink.h"
 #endif
 
 
 #if defined USE_SBUS_RX
-  #include "src/SBUS/SBUS.h"   //sBus interface
+  #include "SBUS/SBUS.h"   //sBus interface
 #endif
 
 #if defined USE_MPU6050_I2C
-  #include "src/MPU6050/MPU6050.h"
+  #include "MPU6050/MPU6050.h"
   MPU6050 mpu6050;
 #elif defined USE_MPU9250_SPI
-  #include "src/MPU9250/MPU9250.h"
-  MPU9250 mpu9250(SPI2,36);
+  #include "MPU9250/MPU9250.h"
 #else
   #error No MPU defined... 
 #endif

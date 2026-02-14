@@ -17,12 +17,17 @@ if __name__ == '__main__':
     args = p.parse_args()
 
     try:
-        import pymavlink
-        from pymavlink.dialects import mavlink10
-    except Exception:
-        print('pymavlink not installed. To generate MAVLink headers locally install pymavlink: pip install pymavlink')
-        print('Alternatively, copy generated MAVLink headers into', args.out)
+        from pymavlink.generator import mavgen
+    except Exception as e:
+        print('pymavlink generator not available:', e)
         raise SystemExit(1)
 
-    print('pymavlink present — generating headers is environment-specific. See pymavlink docs.')
-    print('This helper is a placeholder; if you want, I can generate a minimal set and add it to the repo.')
+    print('Generating MAVLink headers for dialect:', args.dialect)
+    # Use mavgen command
+    cmd = [sys.executable, '-c', 'import sys; sys.path.insert(0, \"C:\\\\Users\\\\shaun\\\\scoop\\\\apps\\\\python313\\\\current\\\\Lib\\\\site-packages\"); from pymavlink.generator.mavgen import mavgen; mavgen(\"' + args.dialect + '\", language=\"C\", output=\"' + args.out + '\")']
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        print('Generated headers in', args.out)
+    else:
+        print('Failed to generate:', result.stderr)
+        raise SystemExit(1)
