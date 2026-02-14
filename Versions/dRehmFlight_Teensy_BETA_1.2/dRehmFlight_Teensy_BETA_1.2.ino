@@ -77,6 +77,7 @@ RcGroups 'jihlein' - IMU implementation overhaul + SBUS implementation
 #include <Wire.h>     //I2c communication
 #include <SPI.h>      //SPI communication
 #include <PWMServo.h> //commanding any extra actuators, installed with teensyduino installer
+#include <EEPROM.h>   //persistent parameter storage (PID gains, tune settings)
 
 #if defined USE_SBUS_RX
   #include "src/SBUS/SBUS.h"   //sBus interface
@@ -202,6 +203,9 @@ float Kp_yaw = 0.3;           //Yaw P-gain
 float Ki_yaw = 0.05;          //Yaw I-gain
 float Kd_yaw = 0.00015;       //Yaw D-gain (be careful when increasing too high, motors will begin to overheat!)
 
+// Autotune safety scaling (0.0 = very conservative, 1.0 = full Z-N)
+float tune_scale = 0.6;
+
 
 
 //========================================================================================================================//
@@ -240,6 +244,29 @@ PWMServo servo4;
 PWMServo servo5;
 PWMServo servo6;
 PWMServo servo7;
+
+// Persistent parameters stored to EEPROM
+struct ParamBlock {
+  uint32_t magic = 0x44465248; // 'DFRH' signature
+  uint16_t version = 1;
+  float Kp_roll_angle;
+  float Ki_roll_angle;
+  float Kd_roll_angle;
+  float Kp_pitch_angle;
+  float Ki_pitch_angle;
+  float Kd_pitch_angle;
+  float Kp_yaw;
+  float Ki_yaw;
+  float Kd_yaw;
+  float tune_scale; // safety scaling for autotune
+};
+static ParamBlock savedParams;
+
+// Autotune state
+static bool autotuneRunning = false;
+static enum AutoAxis {AUTO_NONE=0, AUTO_ROLL=1, AUTO_PITCH=2} autotuneAxis = AUTO_NONE;
+static float autotuneRelayOutRoll = 0.0f;  // override value applied to roll_PID during autotune
+static float autotuneRelayOutPitch = 0.0f; // override value applied to pitch_PID during autotune
 
 
 
@@ -307,6 +334,8 @@ void setup() {
   Serial.begin(500000); //usb serial
   current_time = micros();
   prev_time = current_time;
+  // Load saved PID and tune parameters from EEPROM (if present)
+  loadParametersFromEEPROM();
   delay(3000); //3 second delay for plugging in battery before IMU calibration begins, feel free to comment this out to reduce boot time
   
   //Initialize all pins
@@ -897,24 +926,34 @@ void controlANGLE() {
    */
   
   //Roll
-  error_roll = roll_des - roll_IMU;
-  integral_roll = integral_roll_prev + error_roll*dt;
-  if (channel_1_pwm < 1060) {   //don't let integrator build if throttle is too low
-    integral_roll = 0;
+  if (autotuneRunning && autotuneAxis == AUTO_ROLL) {
+    // override controller output during autotune relay test
+    roll_PID = autotuneRelayOutRoll;
+  } else {
+    error_roll = roll_des - roll_IMU;
+    integral_roll = integral_roll_prev + error_roll*dt;
+    if (channel_1_pwm < 1060) {   //don't let integrator build if throttle is too low
+      integral_roll = 0;
+    }
+    integral_roll = constrain(integral_roll, -i_limit, i_limit); //saturate integrator to prevent unsafe buildup
+    derivative_roll = GyroX;
+    roll_PID = 0.01*(Kp_roll_angle*error_roll + Ki_roll_angle*integral_roll - Kd_roll_angle*derivative_roll); //scaled by .01 to bring within -1 to 1 range
   }
-  integral_roll = constrain(integral_roll, -i_limit, i_limit); //saturate integrator to prevent unsafe buildup
-  derivative_roll = GyroX;
-  roll_PID = 0.01*(Kp_roll_angle*error_roll + Ki_roll_angle*integral_roll - Kd_roll_angle*derivative_roll); //scaled by .01 to bring within -1 to 1 range
 
   //Pitch
-  error_pitch = pitch_des - pitch_IMU;
-  integral_pitch = integral_pitch_prev + error_pitch*dt;
-  if (channel_1_pwm < 1060) {   //don't let integrator build if throttle is too low
-    integral_pitch = 0;
+  if (autotuneRunning && autotuneAxis == AUTO_PITCH) {
+    // override controller output during autotune relay test
+    pitch_PID = autotuneRelayOutPitch;
+  } else {
+    error_pitch = pitch_des - pitch_IMU;
+    integral_pitch = integral_pitch_prev + error_pitch*dt;
+    if (channel_1_pwm < 1060) {   //don't let integrator build if throttle is too low
+      integral_pitch = 0;
+    }
+    integral_pitch = constrain(integral_pitch, -i_limit, i_limit); //saturate integrator to prevent unsafe buildup
+    derivative_pitch = GyroY;
+    pitch_PID = .01*(Kp_pitch_angle*error_pitch + Ki_pitch_angle*integral_pitch - Kd_pitch_angle*derivative_pitch); //scaled by .01 to bring within -1 to 1 range
   }
-  integral_pitch = constrain(integral_pitch, -i_limit, i_limit); //saturate integrator to prevent unsafe buildup
-  derivative_pitch = GyroY;
-  pitch_PID = .01*(Kp_pitch_angle*error_pitch + Ki_pitch_angle*integral_pitch - Kd_pitch_angle*derivative_pitch); //scaled by .01 to bring within -1 to 1 range
 
   //Yaw, stablize on rate from GyroZ
   error_yaw = yaw_des - GyroZ;
@@ -1656,11 +1695,59 @@ void handleSerialCommands() {
         Serial.println("ERR unknown key");
         return;
       }
+      // Persist change immediately
+      saveParametersToEEPROM();
       Serial.print("OK "); Serial.println(cmd);
     } else {
       Serial.println("ERR bad SET format (use: SET <KEY> <VALUE>)");
     }
     return;
+  }
+
+  // Persist/load parameters
+  if (cmd.equalsIgnoreCase("SAVE PARAMS")) {
+    saveParametersToEEPROM();
+    return;
+  }
+  if (cmd.equalsIgnoreCase("LOAD PARAMS")) {
+    loadParametersFromEEPROM();
+    return;
+  }
+
+  // Set tuning aggressiveness for autotune (0.0 - 1.0)
+  if (cmd.startsWith("TUNE_SCALE ")) {
+    String val = cmd.substring(10);
+    float s = val.toFloat();
+    s = constrain(s, 0.0, 1.0);
+    tune_scale = s;
+    Serial.print("OK TUNE_SCALE "); Serial.println(tune_scale);
+    return;
+  }
+
+  // AUTOTUNE <ROLL|PITCH> [relayAmp]
+  if (cmd.startsWith("AUTOTUNE ")) {
+    // format: AUTOTUNE ROLL 0.25
+    int sp = cmd.indexOf(' ');
+    String rest = cmd.substring(sp + 1);
+    rest.trim();
+    int sp2 = rest.indexOf(' ');
+    String axisStr = (sp2 > 0) ? rest.substring(0, sp2) : rest;
+    String ampStr = (sp2 > 0) ? rest.substring(sp2 + 1) : "0.25";
+    axisStr.toUpperCase();
+    float amp = ampStr.toFloat();
+    if (amp <= 0.0f) amp = 0.25f;
+    if (axisStr.equalsIgnoreCase("ROLL")) {
+      Serial.println("AUTOTUNE starting ROLL — keep throttle low and vehicle secure");
+      runRelayAutotune(AUTO_ROLL, amp, 6);
+      return;
+    } else if (axisStr.equalsIgnoreCase("PITCH")) {
+      Serial.println("AUTOTUNE starting PITCH — keep throttle low and vehicle secure");
+      runRelayAutotune(AUTO_PITCH, amp, 6);
+      return;
+    } else {
+      Serial.println("ERR unknown axis (use ROLL or PITCH)");
+      return;
+    }
   }
 
   Serial.println("ERR unknown command");
@@ -1689,3 +1776,201 @@ float invSqrt(float x) {
   float y = tmp * (1.69000231f - 0.714158168f * x * tmp * tmp);
   return y;
 }
+
+// ---------------------- Parameter storage (EEPROM) ----------------------
+void saveParametersToEEPROM() {
+  savedParams.magic = 0x44465248;
+  savedParams.version = 1;
+  savedParams.Kp_roll_angle = Kp_roll_angle;
+  savedParams.Ki_roll_angle = Ki_roll_angle;
+  savedParams.Kd_roll_angle = Kd_roll_angle;
+  savedParams.Kp_pitch_angle = Kp_pitch_angle;
+  savedParams.Ki_pitch_angle = Ki_pitch_angle;
+  savedParams.Kd_pitch_angle = Kd_pitch_angle;
+  savedParams.Kp_yaw = Kp_yaw;
+  savedParams.Ki_yaw = Ki_yaw;
+  savedParams.Kd_yaw = Kd_yaw;
+  savedParams.tune_scale = tune_scale;
+
+  EEPROM.put(0, savedParams);
+  // Some platforms require commit (ESP); wrap defensively
+  #if defined(ESP8266) || defined(ESP32)
+    EEPROM.commit();
+  #endif
+  Serial.println("OK PARAMS SAVED");
+}
+
+void loadParametersFromEEPROM() {
+  ParamBlock tmp;
+  EEPROM.get(0, tmp);
+  if (tmp.magic == 0x44465248 && tmp.version == 1) {
+    Kp_roll_angle = tmp.Kp_roll_angle;
+    Ki_roll_angle = tmp.Ki_roll_angle;
+    Kd_roll_angle = tmp.Kd_roll_angle;
+    Kp_pitch_angle = tmp.Kp_pitch_angle;
+    Ki_pitch_angle = tmp.Ki_pitch_angle;
+    Kd_pitch_angle = tmp.Kd_pitch_angle;
+    Kp_yaw = tmp.Kp_yaw;
+    Ki_yaw = tmp.Ki_yaw;
+    Kd_yaw = tmp.Kd_yaw;
+    tune_scale = tmp.tune_scale;
+    Serial.println("OK PARAMS LOADED");
+  } else {
+    Serial.println("NO PARAMS IN EEPROM");
+  }
+}
+
+// ---------------------- Relay autotune (blocking) -------------------------
+// Simple relay test: toggle controller output between +/-relayAmp and record
+// process variable peaks to estimate Ku and Pu. Uses Ziegler-Nichols PID rules
+// and applies safety scaling (tune_scale).
+
+bool runRelayAutotune(AutoAxis axis, float relayAmp = 0.25f, int cycles = 6) {
+  if (channel_1_pwm > 1060) {
+    Serial.println("ERR: throttle must be low (<1060) to run autotune");
+    return false;
+  }
+  if (autotuneRunning) {
+    Serial.println("ERR: autotune already running");
+    return false;
+  }
+
+  Serial.print("Starting relay autotune for ");
+  Serial.println(axis == AUTO_ROLL ? "ROLL" : "PITCH");
+
+  // Prepare
+  autotuneRunning = true;
+  autotuneAxis = axis;
+  autotuneRelayOutRoll = 0.0f;
+  autotuneRelayOutPitch = 0.0f;
+
+  // Clear integrators for a cleaner response
+  integral_roll = 0; integral_pitch = 0; integral_yaw = 0;
+  integral_roll_prev = 0; integral_pitch_prev = 0; integral_yaw_prev = 0;
+
+  // Sampling buffers
+  const int MAX_SAMPLES = 16000; // enough for long tests at 2kHz
+  static float pv[MAX_SAMPLES];
+  static unsigned long tstamp[MAX_SAMPLES];
+  int sampleIndex = 0;
+
+  // Relay toggling parameters
+  const unsigned long halfPeriodMs = 500; // half period for relay toggle (500ms -> 1s full cycle)
+  int totalToggles = cycles * 2; // number of relay state changes
+
+  unsigned long globalStart = micros();
+
+  for (int toggle = 0; toggle < totalToggles; toggle++) {
+    float out = (toggle % 2 == 0) ? relayAmp : -relayAmp;
+    if (axis == AUTO_ROLL) autotuneRelayOutRoll = out; else autotuneRelayOutPitch = out;
+
+    unsigned long start = micros();
+    while ((micros() - start) < (unsigned long)halfPeriodMs * 1000UL) {
+      // sample PV (roll or pitch)
+      float pvVal = (axis == AUTO_ROLL) ? roll_IMU : pitch_IMU;
+      if (sampleIndex < MAX_SAMPLES) {
+        pv[sampleIndex] = pvVal;
+        tstamp[sampleIndex] = micros() - globalStart;
+        sampleIndex++;
+      }
+      // keep sensors and loop alive
+      getIMUdata();
+      Madgwick(GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ, MagY, -MagX, MagZ, dt);
+      getCommands();
+      failSafe();
+      loopRate(2000);
+    }
+  }
+
+  // Stop override
+  autotuneRelayOutRoll = 0.0f;
+  autotuneRelayOutPitch = 0.0f;
+  autotuneRunning = false;
+  autotuneAxis = AUTO_NONE;
+
+  if (sampleIndex < 10) {
+    Serial.println("ERR: insufficient samples collected");
+    return false;
+  }
+
+  // Peak detection (simple local extrema)
+  float maxima[256]; unsigned long maxTimes[256]; int nMax = 0;
+  float minima[256]; unsigned long minTimes[256]; int nMin = 0;
+  for (int i = 1; i < sampleIndex - 1; i++) {
+    if (pv[i] >= pv[i-1] && pv[i] >= pv[i+1]) {
+      if (nMax < 256) { maxima[nMax] = pv[i]; maxTimes[nMax] = tstamp[i]; nMax++; }
+    }
+    if (pv[i] <= pv[i-1] && pv[i] <= pv[i+1]) {
+      if (nMin < 256) { minima[nMin] = pv[i]; minTimes[nMin] = tstamp[i]; nMin++; }
+    }
+  }
+
+  if (nMax < 4 || nMin < 4) {
+    Serial.println("ERR: not enough peaks detected; try increasing relay amplitude or cycles");
+    return false;
+  }
+
+  // discard first peak (transient) and compute average peak-to-peak amplitude and period
+  int useMaxStart = 1; int useMinStart = 1;
+  int usablePairs = min(nMax - useMaxStart, nMin - useMinStart);
+  if (usablePairs < 3) usablePairs = min(nMax - useMaxStart, nMin - useMinStart);
+
+  // compute average peak amplitude (peak-to-peak / 2)
+  float sumAmp = 0.0f; int pairs = 0;
+  int take = min(usablePairs, 6);
+  for (int i = 0; i < take; i++) {
+    float a = maxima[useMaxStart + i] - minima[useMinStart + i];
+    sumAmp += a;
+    pairs++;
+  }
+  float peakToPeak = (pairs > 0) ? (sumAmp / pairs) : 0.0f;
+  float A = peakToPeak / 2.0f; // amplitude
+
+  // compute average period Pu from maxima times
+  float sumPeriod = 0.0f; int nPeriods = 0;
+  for (int i = 1; i < min(nMax, 10); i++) {
+    unsigned long dt_us = maxTimes[i] - maxTimes[i-1];
+    if (dt_us > 10000) { sumPeriod += (float)dt_us / 1000000.0f; nPeriods++; }
+  }
+  float Pu = (nPeriods > 0) ? (sumPeriod / nPeriods) : 0.0f;
+
+  if (A <= 0.0f || Pu <= 0.0f) {
+    Serial.println("ERR: invalid amplitude/period measured");
+    return false;
+  }
+
+  const float PI_F = 3.14159265358979323846f;
+  float Ku = (4.0f * relayAmp) / (PI_F * A);
+
+  // Ziegler-Nichols PID tuning (with safety scaling)
+  float Kp_new = 0.6f * Ku * tune_scale;
+  float Ti = 0.5f * Pu; // integral time
+  float Ki_new = (Ti > 0.0f) ? (Kp_new / Ti) : 0.0f; // Ki = Kp/Ti
+  float Td = 0.125f * Pu;
+  float Kd_new = Kp_new * Td; // derivative gain
+
+  // Apply tuned gains to selected axis (angle-mode gains)
+  if (axis == AUTO_ROLL) {
+    Kp_roll_angle = Kp_new;
+    Ki_roll_angle = Ki_new;
+    Kd_roll_angle = Kd_new;
+  } else {
+    Kp_pitch_angle = Kp_new;
+    Ki_pitch_angle = Ki_new;
+    Kd_pitch_angle = Kd_new;
+  }
+
+  // Persist tuned gains
+  saveParametersToEEPROM();
+
+  // Report results
+  Serial.print("{\"Ku\":"); Serial.print(Ku);
+  Serial.print(",\"Pu\":"); Serial.print(Pu);
+  Serial.print(",\"Kp\":"); Serial.print(Kp_new);
+  Serial.print(",\"Ki\":"); Serial.print(Ki_new);
+  Serial.print(",\"Kd\":"); Serial.print(Kd_new);
+  Serial.println("}");
+
+  return true;
+}
+
