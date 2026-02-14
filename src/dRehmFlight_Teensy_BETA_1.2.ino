@@ -79,6 +79,7 @@ RcGroups 'jihlein' - IMU implementation overhaul + SBUS implementation
 #include <PWMServo.h> //commanding any extra actuators, installed with teensyduino installer
 #include <EEPROM.h>   //persistent parameter storage (PID gains, tune settings)
 #include <SD.h>       //SD card logging (optional)
+#include <string.h>
 
 // TinyML fallback model (pure-C) - included by default; real TFLM path is optional at build time
 #include "TinyML/simple_model.h"
@@ -688,7 +689,10 @@ void getIMUdata() {
    * the readings. The filter parameters B_gyro and B_accel are set to be good for a 2kHz loop rate. Finally,
    * the constant errors found in calculate_IMU_error() on startup are subtracted from the accelerometer and gyro readings.
    */
-  int16_t AcX,AcY,AcZ,GyX,GyY,GyZ,MgX,MgY,MgZ;
+  int16_t AcX,AcY,AcZ,GyX,GyY,GyZ;
+#if defined USE_MPU9250_SPI
+  int16_t MgX,MgY,MgZ;
+#endif
 
   #if defined USE_MPU6050_I2C
     mpu6050.getMotion6(&AcX, &AcY, &AcZ, &GyX, &GyY, &GyZ);
@@ -762,7 +766,10 @@ void calculate_IMU_error() {
    * accelerometer values AccX, AccY, AccZ, GyroX, GyroY, GyroZ in getIMUdata(). This eliminates drift in the
    * measurement. 
    */
-  int16_t AcX,AcY,AcZ,GyX,GyY,GyZ,MgX,MgY,MgZ;
+  int16_t AcX,AcY,AcZ,GyX,GyY,GyZ;
+#if defined USE_MPU9250_SPI
+  int16_t MgX,MgY,MgZ;
+#endif
   
   //Read IMU values 12000 times
   int c = 0;
@@ -1911,7 +1918,10 @@ void handleSerialCommands() {
   if (cmd.equalsIgnoreCase("MAVBRIDGE STOP")) { mavlinkBridgeEnabled = false; Serial.println("MAVBRIDGE STOPPED"); return; }
 
   // TinyML (TFLM) controls (stub)
-  if (cmd.equalsIgnoreCase("TFLM ENABLE")) { tflmEnabled = true; initTFLM(); Serial.println("TFLM ENABLED"); return; }
+  if (cmd.equalsIgnoreCase("TFLM ENABLE")) { 
+    if (initTFLM()) { tflmEnabled = true; Serial.println("TFLM ENABLED"); } 
+    else { Serial.println("TFLM INIT FAILED"); }
+    return; }
   if (cmd.equalsIgnoreCase("TFLM DISABLE")) { tflmEnabled = false; Serial.println("TFLM DISABLED"); return; }
   if (cmd.equalsIgnoreCase("TFLM LOAD")) { Serial.println("TFLM LOAD: stub - add model and enable USE_TFLM at build"); return; }
 
@@ -2314,27 +2324,31 @@ void recordUpdate() {
 }
 
 // ---------------------- Simple anomaly detector (placeholder) ------------------
-void initTFLM() {
+#include <stdint.h>
+
+bool initTFLM() {
 #if USE_TFLM
   // Real TensorFlow Lite Micro initialization (requires model_data.h and TFLM library in project)
   const tflite::Model* model = tflite::GetModel(model_data);
   if (model->version() != TFLITE_SCHEMA_VERSION) {
     Serial.println("TFLM: model schema mismatch");
-    return;
+    return false;
   }
   static tflite::AllOpsResolver resolver;
   tflm_interpreter = new tflite::MicroInterpreter(model, resolver, tflm_tensor_arena, TFLM_ARENA_SIZE, nullptr);
   if (tflm_interpreter->AllocateTensors() != kTfLiteOk) {
     Serial.println("TFLM: AllocateTensors() failed");
-    return;
+    return false;
   }
   tflm_input = tflm_interpreter->input(0);
   tflm_output = tflm_interpreter->output(0);
   Serial.println("TFLM: initialized (using model_data.h)");
+  return true;
 #else
   // Fallback tiny-C model (works without adding TensorFlow Lite Micro)
   simple_model_init();
   Serial.println("TFLM: fallback (C model) initialized");
+  return true;
 #endif
 } 
 

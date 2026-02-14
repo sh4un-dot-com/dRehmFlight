@@ -55,7 +55,9 @@ if __name__ == '__main__':
             raise FileNotFoundError('Dialect XML not found for %s (checked %s)' % (args.dialect, xml_path))
 
         # Call the mavgen API: it expects (opts, [xml_files])
-        mavgen.mavgen(opts, [os.path.relpath(xml_path)])
+        # Use absolute path to the XML file to avoid cross-drive relpath errors on Windows
+        abs_xml = os.path.abspath(xml_path)
+        mavgen.mavgen(opts, [abs_xml])
         print('Generated headers in', args.out)
     except Exception as e:
         print('MAVLink header generation failed:', e)

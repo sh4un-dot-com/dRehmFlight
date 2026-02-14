@@ -1,0 +1,2 @@
+# Helpful requirements for tools that generate assets (install in your venv)
+pymavlink>=2.5.0
