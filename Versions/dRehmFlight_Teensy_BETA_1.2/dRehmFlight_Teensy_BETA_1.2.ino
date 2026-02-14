@@ -305,6 +305,8 @@ int s1_command_PWM, s2_command_PWM, s3_command_PWM, s4_command_PWM, s5_command_P
 
 void setup() {
   Serial.begin(500000); //usb serial
+  current_time = micros();
+  prev_time = current_time;
   delay(3000); //3 second delay for plugging in battery before IMU calibration begins, feel free to comment this out to reduce boot time
   
   //Initialize all pins
@@ -440,6 +442,26 @@ void loop() {
   getCommands(); //pulls current available radio commands
   failSafe(); //prevent failures in event of bad receiver connection, defaults to failsafe values assigned in setup
 
+  // Telemetry streaming (JSON) when aux channel 6 is high — useful for ML/AI ingestion or logging
+  if (channel_6_pwm > 1500 && current_time - serial_counter > 200000) {
+    serial_counter = micros();
+    Serial.print('{');
+    Serial.print("\"t_ms\":"); Serial.print(millis());
+    Serial.print(",\"roll\":"); Serial.print(roll_IMU);
+    Serial.print(",\"pitch\":"); Serial.print(pitch_IMU);
+    Serial.print(",\"yaw\":"); Serial.print(yaw_IMU);
+    Serial.print(",\"thro\":"); Serial.print(thro_des);
+    Serial.print(",\"loop_us\":"); Serial.print(dt*1000000.0);
+    Serial.print(",\"ch1\":"); Serial.print(channel_1_pwm);
+    Serial.print(",\"ch2\":"); Serial.print(channel_2_pwm);
+    Serial.print(",\"ch3\":"); Serial.print(channel_3_pwm);
+    Serial.print(",\"ch4\":"); Serial.print(channel_4_pwm);
+    Serial.println('}');
+  }
+
+  // Process simple serial CLI (GET/SET) for PID and telemetry
+  handleSerialCommands(); //process serial CLI (GET/SET/TEL)
+
   //Regulate loop rate
   loopRate(2000); //do not exceed 2000Hz, all filter parameters tuned to 2000Hz by default
 }
@@ -547,20 +569,30 @@ void getIMUdata() {
   GyroZ_prev = GyroZ;
 
   //Magnetometer
-  MagX = MgX/6.0; //uT
-  MagY = MgY/6.0;
-  MagZ = MgZ/6.0;
-  //Correct the outputs with the calculated error values
-  MagX = (MagX - MagErrorX)*MagScaleX;
-  MagY = (MagY - MagErrorY)*MagScaleY;
-  MagZ = (MagZ - MagErrorZ)*MagScaleZ;
-  //LP filter magnetometer data
-  MagX = (1.0 - B_mag)*MagX_prev + B_mag*MagX;
-  MagY = (1.0 - B_mag)*MagY_prev + B_mag*MagY;
-  MagZ = (1.0 - B_mag)*MagZ_prev + B_mag*MagZ;
-  MagX_prev = MagX;
-  MagY_prev = MagY;
-  MagZ_prev = MagZ;
+  #if defined USE_MPU9250_SPI
+    MagX = MgX/6.0; //uT
+    MagY = MgY/6.0;
+    MagZ = MgZ/6.0;
+    //Correct the outputs with the calculated error values
+    MagX = (MagX - MagErrorX)*MagScaleX;
+    MagY = (MagY - MagErrorY)*MagScaleY;
+    MagZ = (MagZ - MagErrorZ)*MagScaleZ;
+    //LP filter magnetometer data
+    MagX = (1.0 - B_mag)*MagX_prev + B_mag*MagX;
+    MagY = (1.0 - B_mag)*MagY_prev + B_mag*MagY;
+    MagZ = (1.0 - B_mag)*MagZ_prev + B_mag*MagZ;
+    MagX_prev = MagX;
+    MagY_prev = MagY;
+    MagZ_prev = MagZ;
+  #else
+    //No magnetometer available (MPU6050): set to zero so Madgwick6DOF is used safely
+    MagX = 0.0f;
+    MagY = 0.0f;
+    MagZ = 0.0f;
+    MagX_prev = 0.0f;
+    MagY_prev = 0.0f;
+    MagZ_prev = 0.0f;
+  #endif
 }
 
 void calculate_IMU_error() {
@@ -1284,7 +1316,7 @@ float floatFaderLinear(float param, float param_min, float param_max, float fade
   return param;
 }
 
-float switchRollYaw(int reverseRoll, int reverseYaw) {
+void switchRollYaw(int reverseRoll, int reverseYaw) {
   //DESCRIPTION: Switches roll_des and yaw_des variables for tailsitter-type configurations
   /*
    * Takes in two integers (either 1 or -1) corresponding to the desired reversing of the roll axis and yaw axis, respectively.
@@ -1310,12 +1342,13 @@ void throttleCut() {
    * the motors to anything other than minimum value. Safety first. 
    */
   if (channel_5_pwm > 1500) {
-    m1_command_PWM = 120;
-    m2_command_PWM = 120;
-    m3_command_PWM = 120;
-    m4_command_PWM = 120;
-    m5_command_PWM = 120;
-    m6_command_PWM = 120;
+    // Use 125 which matches OneShot125 minimum bound used elsewhere
+    m1_command_PWM = 125;
+    m2_command_PWM = 125;
+    m3_command_PWM = 125;
+    m4_command_PWM = 125;
+    m5_command_PWM = 125;
+    m6_command_PWM = 125;
     
     //uncomment if using servo PWM variables to control motor ESCs
     //s1_command_PWM = 0;
@@ -1560,6 +1593,79 @@ void printLoopRate() {
     Serial.println(dt*1000000.0);
   }
 }
+
+// Simple serial CLI + AI-friendly telemetry output
+// Commands supported over Serial (line-terminated):
+//  GET STATUS   -> JSON telemetry (roll/pitch/yaw, throttle, channels, loop_us)
+//  GET PID      -> JSON current PID gains
+//  SET <KEY> <VALUE> -> set a PID gain, e.g. "SET Kp_roll_angle 0.2"
+// This provides an easy integration point for offboard AI tools and autotuners.
+void handleSerialCommands() {
+  if (!Serial || Serial.available() == 0) return;
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  if (cmd.length() == 0) return;
+
+  if (cmd.equalsIgnoreCase("GET STATUS")) {
+    Serial.print("{\"roll\":"); Serial.print(roll_IMU);
+    Serial.print(",\"pitch\":"); Serial.print(pitch_IMU);
+    Serial.print(",\"yaw\":"); Serial.print(yaw_IMU);
+    Serial.print(",\"thro\":"); Serial.print(thro_des);
+    Serial.print(",\"loop_us\":"); Serial.print(dt*1000000.0);
+    Serial.print(",\"ch1\":"); Serial.print(channel_1_pwm);
+    Serial.print(",\"ch2\":"); Serial.print(channel_2_pwm);
+    Serial.print(",\"ch3\":"); Serial.print(channel_3_pwm);
+    Serial.print(",\"ch4\":"); Serial.print(channel_4_pwm);
+    Serial.println("}");
+    return;
+  }
+
+  if (cmd.equalsIgnoreCase("GET PID")) {
+    Serial.print("{");
+    Serial.print("\"Kp_roll_angle\":"); Serial.print(Kp_roll_angle); Serial.print(",");
+    Serial.print("\"Ki_roll_angle\":"); Serial.print(Ki_roll_angle); Serial.print(",");
+    Serial.print("\"Kd_roll_angle\":"); Serial.print(Kd_roll_angle); Serial.print(",");
+    Serial.print("\"Kp_pitch_angle\":"); Serial.print(Kp_pitch_angle); Serial.print(",");
+    Serial.print("\"Ki_pitch_angle\":"); Serial.print(Ki_pitch_angle); Serial.print(",");
+    Serial.print("\"Kd_pitch_angle\":"); Serial.print(Kd_pitch_angle); Serial.print(",");
+    Serial.print("\"Kp_yaw\":"); Serial.print(Kp_yaw); Serial.print(",");
+    Serial.print("\"Ki_yaw\":"); Serial.print(Ki_yaw); Serial.print(",");
+    Serial.print("\"Kd_yaw\":"); Serial.print(Kd_yaw);
+    Serial.println("}");
+    return;
+  }
+
+  if (cmd.startsWith("SET ")) {
+    // format: SET <KEY> <VALUE>
+    int firstSpace = cmd.indexOf(' ');
+    int secondSpace = cmd.indexOf(' ', firstSpace + 1);
+    if (secondSpace > 0) {
+      String key = cmd.substring(firstSpace + 1, secondSpace);
+      String valueStr = cmd.substring(secondSpace + 1);
+      float v = valueStr.toFloat();
+      if (key == "Kp_roll_angle") Kp_roll_angle = v;
+      else if (key == "Ki_roll_angle") Ki_roll_angle = v;
+      else if (key == "Kd_roll_angle") Kd_roll_angle = v;
+      else if (key == "Kp_pitch_angle") Kp_pitch_angle = v;
+      else if (key == "Ki_pitch_angle") Ki_pitch_angle = v;
+      else if (key == "Kd_pitch_angle") Kd_pitch_angle = v;
+      else if (key == "Kp_yaw") Kp_yaw = v;
+      else if (key == "Ki_yaw") Ki_yaw = v;
+      else if (key == "Kd_yaw") Kd_yaw = v;
+      else {
+        Serial.println("ERR unknown key");
+        return;
+      }
+      Serial.print("OK "); Serial.println(cmd);
+    } else {
+      Serial.println("ERR bad SET format (use: SET <KEY> <VALUE>)");
+    }
+    return;
+  }
+
+  Serial.println("ERR unknown command");
+}
+
 
 //=========================================================================================//
 
